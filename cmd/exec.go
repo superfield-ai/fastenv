@@ -18,9 +18,14 @@
 // namespaces; writes land in the fork's overlayfs upper layer and are visible
 // via `fastenv diff`. The base image is not affected.
 //
+// Network isolation is controlled by --network:
+//   - --network=none (default): a new network namespace with only loopback is
+//     created. No CNI plugin or external binary is required.
+//   - --network=host: shares the host network namespace.
+//
 // On completion a structured JSON log line is written to stdout:
 //
-//	{"fork_id":"...","command":[...],"exit_code":0,"duration":"..."}
+//	{"fork_id":"...","command":[...],"exit_code":0,"duration":"...","network_mode":"none"}
 //
 // The process exits with the same exit code as the inner command.
 //
@@ -57,6 +62,7 @@ func newExecCmd() *cobra.Command {
 		crunPath    string
 		workDir     string
 		envVars     []string
+		networkMode string
 	)
 
 	cmd := &cobra.Command{
@@ -95,6 +101,7 @@ The process exits with the same exit code as the inner command.`,
 				MemoryLimitBytes: uint64(memBytes),
 				WorkDir:          workDir,
 				Env:              envVars,
+				Network:          execer.NetworkMode(networkMode),
 			})
 			if err != nil {
 				return fmt.Errorf("exec: %w", err)
@@ -125,6 +132,8 @@ The process exits with the same exit code as the inner command.`,
 		"working directory inside the container")
 	cmd.Flags().StringArrayVarP(&envVars, "env", "e", nil,
 		"set environment variable KEY=VALUE (can be repeated)")
+	cmd.Flags().StringVar(&networkMode, "network", string(execer.NetworkNone),
+		`network mode: "none" (isolated loopback-only netns, default) or "host" (share host network)`)
 
 	return cmd
 }

@@ -42,7 +42,7 @@ func TestExecAppearsInHelp(t *testing.T) {
 	_ = rootCmd.Execute()
 
 	output := buf.String()
-	for _, want := range []string{"--cpu", "--memory", "--crun-path"} {
+	for _, want := range []string{"--cpu", "--memory", "--crun-path", "--network"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("exec --help missing %q flag; output:\n%s", want, output)
 		}
