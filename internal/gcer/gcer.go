@@ -55,9 +55,6 @@ const (
 	// Value is an RFC 3339 UTC timestamp.
 	forkCreatedLabel = "fastenv.fork.created"
 
-	// forkBaseLabel is the snapshot label carrying the base image name.
-	forkBaseLabel = "fastenv.fork.base"
-
 	// DefaultTTL is the default fork TTL: forks older than this are eligible
 	// for TTL eviction.
 	DefaultTTL = 24 * time.Hour
