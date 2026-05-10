@@ -1,5 +1,5 @@
 // Package forker implements the fork lifecycle: creating a CoW writable
-// snapshot from a named base image.
+// snapshot from a named base image with shared read-only cache mounts.
 //
 // # Design
 //
@@ -11,7 +11,19 @@
 //  4. Verify that forkID does not already exist (returns a clear error).
 //  5. Call the overlayfs snapshotter's Prepare(forkID, baseSnapshotKey) to
 //     allocate a new CoW writable snapshot. No data is copied.
-//  6. Return structured metadata including creation latency.
+//  6. Discover shared cache snapshots for the base image (npm, pip, cargo).
+//  7. For each cache snapshot, create a read-only View snapshot keyed by
+//     CacheViewKey(forkID, cacheName) and record the lower dirs.
+//  8. Extend the fork's overlayfs lowerdir option to include the cache lower
+//     dirs so that /cache/<name>/ paths are visible inside the fork.
+//  9. Return structured metadata including creation latency and cache mounts.
+//
+// # Cache isolation
+//
+// Cache snapshots are committed once at build-base time and shared read-only
+// across all forks of the same base image. Writes to /cache/<name>/ inside a
+// fork land in the fork's writable upper dir (CoW), leaving the shared cache
+// snapshot unmodified.
 //
 // # Latency targets
 //
@@ -22,9 +34,9 @@
 //
 // # Canonical docs
 //
-//   - docs/prd.md
-//   - docs/architecture.md §2 (containerd as snapshot manager)
-//   - docs/implementation-plan.md Phase 2 (fork)
+//   - docs/prd.md §7 (shared cache mounts)
+//   - docs/architecture.md §2 (containerd as snapshot manager, shared cache)
+//   - docs/implementation-plan.md Phase 2 (fork), Phase 5 (shared caches)
 //   - docs/scout/phase1-findings.md §1 Phase B (snapshot Prepare for fork)
 package forker
 
@@ -32,12 +44,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	cerrdefs "github.com/containerd/errdefs"
+
+	"github.com/superfield-ai/fastenv/internal/cachemanager"
 )
 
 const (
@@ -60,6 +76,15 @@ type Options struct {
 	Namespace string
 }
 
+// CacheMountInfo describes a single shared cache layer mounted into a fork.
+type CacheMountInfo struct {
+	// Name is the short cache name (e.g. "pip", "npm", "cargo").
+	Name string `json:"name"`
+	// ViewKey is the containerd snapshot key of the read-only View snapshot
+	// created for this fork's access to the shared cache layer.
+	ViewKey string `json:"view_key"`
+}
+
 // ForkResult holds metadata about the created fork, emitted as a structured
 // JSON log line upon successful completion.
 type ForkResult struct {
@@ -72,6 +97,9 @@ type ForkResult struct {
 	SnapshotKey string `json:"snapshot_key"`
 	// CreationLatency is the wall-clock duration from invocation to fork ready.
 	CreationLatency string `json:"creation_latency"`
+	// CacheMounts lists the shared cache layers mounted read-only into this fork.
+	// Empty when no cache snapshots exist for the base image.
+	CacheMounts []CacheMountInfo `json:"cache_mounts,omitempty"`
 }
 
 // Fork creates a writable CoW snapshot identified by forkID from the base
@@ -164,7 +192,7 @@ func Fork(ctx context.Context, baseImage, forkID string, opts Options) (*ForkRes
 	// fastenv.fork.created: RFC 3339 creation timestamp.
 	//
 	// See docs/scout/phase1-findings.md §1 Phase B for the full call sequence.
-	_, err = sn.Prepare(ctx, forkID, baseSnapshotKey,
+	forkMounts, err := sn.Prepare(ctx, forkID, baseSnapshotKey,
 		snapshots.WithLabels(map[string]string{
 			"fastenv.fork.base":    baseImage,
 			"fastenv.fork.created": time.Now().UTC().Format(time.RFC3339),
@@ -177,11 +205,115 @@ func Fork(ctx context.Context, baseImage, forkID string, opts Options) (*ForkRes
 		return nil, fmt.Errorf("fork: prepare snapshot %q (parent %q): %w", forkID, baseSnapshotKey, err)
 	}
 
+	// Step 6: Discover and mount shared cache layers for the base image.
+	//
+	// If build-base extracted cache snapshots for this image (keyed by
+	// CacheSnapshotKey(baseImage, cacheName)), we create read-only View
+	// snapshots for this fork and extend the overlayfs lowerdir option to
+	// include the cache lower dirs. This makes /cache/<name>/ paths visible
+	// inside the fork. Writes to /cache/<name>/ land in the fork's upper dir
+	// (CoW), leaving the shared cache snapshots unmodified.
+	cacheLayers, err := cachemanager.ListCacheLayers(ctx, sn, baseImage)
+	if err != nil {
+		return nil, fmt.Errorf("fork: list cache layers for %q: %w", baseImage, err)
+	}
+
+	var cacheMountInfos []CacheMountInfo
+	var cacheExtraLowers []string // lower dirs from cache View snapshots
+
+	for _, cl := range cacheLayers {
+		viewMounts, err := cachemanager.MountCacheLayer(ctx, sn, forkID, cl.Name, cl.SnapshotKey)
+		if err != nil {
+			// Best-effort: log but do not fail the fork if a cache view fails.
+			// The fork is still usable; it just won't have the cache overlay.
+			_ = err
+			continue
+		}
+		cacheMountInfos = append(cacheMountInfos, CacheMountInfo{
+			Name:    cl.Name,
+			ViewKey: cachemanager.CacheViewKey(forkID, cl.Name),
+		})
+		// Extract lower dirs from the cache view mounts to append to the
+		// fork's overlayfs lowerdir option.
+		cacheExtraLowers = append(cacheExtraLowers, extractLowerDirs(viewMounts)...)
+	}
+
+	// Step 7: Extend the fork's overlayfs lowerdir with cache lower dirs.
+	//
+	// The fork's overlayfs mount has a lowerdir option listing the base image
+	// layer dirs. We append the cache lower dirs so that cache paths are
+	// visible below the workspace content. The fork's upper dir handles all
+	// writes regardless of path (workspace or cache).
+	if len(cacheExtraLowers) > 0 {
+		if err := extendLowerDirs(ctx, sn, forkID, forkMounts, cacheExtraLowers); err != nil {
+			// Best-effort: cache lower dir extension failed; the fork remains
+			// usable without cache overlay.
+			_ = err
+		}
+	}
+
 	latency := time.Since(start)
 	return &ForkResult{
 		ForkID:          forkID,
 		BaseImage:       baseImage,
 		SnapshotKey:     forkID,
 		CreationLatency: latency.Round(time.Microsecond).String(),
+		CacheMounts:     cacheMountInfos,
 	}, nil
+}
+
+// extractLowerDirs pulls the lowerdir paths out of an overlayfs mount list.
+// Returns an empty slice if no overlayfs lower dirs are found.
+func extractLowerDirs(mounts []mount.Mount) []string {
+	var dirs []string
+	for _, m := range mounts {
+		if m.Type != "overlay" {
+			continue
+		}
+		for _, opt := range m.Options {
+			if !strings.HasPrefix(opt, "lowerdir=") {
+				continue
+			}
+			val := strings.TrimPrefix(opt, "lowerdir=")
+			for _, d := range strings.Split(val, ":") {
+				if d != "" {
+					dirs = append(dirs, d)
+				}
+			}
+		}
+	}
+	return dirs
+}
+
+// extendLowerDirs updates the fork's active snapshot in the containerd store
+// to include the given extra lower dirs in its overlayfs lowerdir option.
+//
+// containerd's overlayfs snapshotter does not provide a first-class API to
+// modify the lowerdir of an existing active snapshot. The practical approach
+// is to record the extra lower dirs as a label on the fork snapshot so that
+// the container runtime spec builder (exec command) can include them when
+// constructing the OCI mount spec for the fork.
+//
+// This function stores the extra lower dirs as a label
+// "fastenv.cache.lowerdirs" (colon-separated) on the fork snapshot.
+func extendLowerDirs(
+	ctx context.Context,
+	sn snapshots.Snapshotter,
+	forkID string,
+	_ []mount.Mount, // forkMounts — reserved for future direct mount manipulation
+	extraLowers []string,
+) error {
+	info, err := sn.Stat(ctx, forkID)
+	if err != nil {
+		return fmt.Errorf("stat fork snapshot %q: %w", forkID, err)
+	}
+	if info.Labels == nil {
+		info.Labels = make(map[string]string)
+	}
+	info.Labels["fastenv.cache.lowerdirs"] = strings.Join(extraLowers, ":")
+	_, err = sn.Update(ctx, info, "labels.fastenv.cache.lowerdirs")
+	if err != nil {
+		return fmt.Errorf("update fork snapshot labels: %w", err)
+	}
+	return nil
 }

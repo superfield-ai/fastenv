@@ -17,6 +17,19 @@
 //  7. Write the config and manifest blobs to the content store.
 //  8. Register (or update) the image in containerd's image service under the
 //     caller-supplied tag name.
+//  9. Extract package cache directories (npm, pip, cargo) as separate
+//     committed snapshot layers for shared read-only cache mounts at fork time.
+//
+// # Cache layer extraction
+//
+// If the source directory contains a cache/ subdirectory with well-known
+// package cache subdirectories (npm, pip, cargo), those subdirectories are
+// committed as separate named snapshot layers in containerd's snapshot store.
+// The snapshot key scheme is <imageName>:cache:<type> (e.g. my-ws:cache:pip).
+// These committed snapshots are shared read-only across all forks of the same
+// base image, providing CoW cache isolation per fork without duplicating bytes.
+//
+// See internal/cachemanager for the full cache layer lifecycle.
 //
 // # Content-addressed stability
 //
@@ -31,8 +44,8 @@
 // # Canonical docs
 //
 //   - docs/prd.md
-//   - docs/architecture.md
-//   - docs/implementation-plan.md Phase 2 (build-base)
+//   - docs/architecture.md §2 (shared content-addressed cache)
+//   - docs/implementation-plan.md Phase 2 (build-base), Phase 5 (shared caches)
 //   - docs/scout/phase1-findings.md §1 Phase A (layer ingest sequence)
 package builder
 
@@ -54,6 +67,8 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/superfield-ai/fastenv/internal/cachemanager"
 )
 
 const (
@@ -66,6 +81,17 @@ const (
 	dialTimeout = 10 * time.Second
 )
 
+// CacheLayerSummary is a compact view of a single cache layer committed during
+// build-base, included in BuildResult for observability.
+type CacheLayerSummary struct {
+	// Name is the short cache name, e.g. "pip", "npm", "cargo".
+	Name string `json:"name"`
+	// SnapshotKey is the containerd snapshot key for the committed layer.
+	SnapshotKey string `json:"snapshot_key"`
+	// SizeBytes is the compressed size of the cache layer blob.
+	SizeBytes int64 `json:"size_bytes"`
+}
+
 // BuildResult holds metadata about the built image, emitted as a structured
 // JSON log line upon successful completion.
 type BuildResult struct {
@@ -77,6 +103,9 @@ type BuildResult struct {
 	TotalSize int64 `json:"total_size_bytes"`
 	// BuildDuration is the wall-clock time taken to build the image.
 	BuildDuration string `json:"build_duration"`
+	// CacheLayers lists the package-cache snapshot layers extracted during build.
+	// Empty when no well-known cache directories were found in the source tree.
+	CacheLayers []CacheLayerSummary `json:"cache_layers,omitempty"`
 }
 
 // Options controls the behaviour of BuildBase.
@@ -145,13 +174,42 @@ func BuildBase(ctx context.Context, sourceDir, imageName string, opts Options) (
 		return nil, fmt.Errorf("build-base: register image: %w", err)
 	}
 
+	// --- Step 7: extract cache directories as shared snapshot layers --------
+	//
+	// Package cache directories (npm, pip, cargo) present in <sourceDir>/cache/
+	// are committed as separate named snapshot layers so that forks can mount
+	// them read-only, sharing the same cache bytes across all concurrent forks.
+	//
+	// This step is best-effort: if cache extraction fails for any cache name,
+	// we surface the error so the operator can investigate. A missing cache dir
+	// is silently skipped by BuildCacheLayers.
+	cacheResult, err := cachemanager.BuildCacheLayers(
+		ctx,
+		cs,
+		client.SnapshotService("overlayfs"),
+		sourceDir,
+		imageName,
+		nil, // use DefaultCacheNames
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build-base: extract cache layers: %w", err)
+	}
+
 	totalSize := layerDesc.Size + configDesc.Size + manifestDesc.Size
-	return &BuildResult{
+	result := &BuildResult{
 		ImageName:      imageName,
 		ManifestDigest: manifestDesc.Digest.String(),
 		TotalSize:      totalSize,
 		BuildDuration:  time.Since(start).Round(time.Millisecond).String(),
-	}, nil
+	}
+	for _, cl := range cacheResult.Layers {
+		result.CacheLayers = append(result.CacheLayers, CacheLayerSummary{
+			Name:        cl.Name,
+			SnapshotKey: cl.SnapshotKey,
+			SizeBytes:   cl.SizeBytes,
+		})
+	}
+	return result, nil
 }
 
 // createLayer streams the source directory as an OCI tar+gzip layer, writes it

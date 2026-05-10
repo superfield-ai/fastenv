@@ -1,22 +1,28 @@
 // du.go — cobra command for `fastenv du`.
 //
-// du reports the writable layer disk usage for a fork, excluding base image
-// bytes. It calls Snapshotter.Usage(forkKey) which returns bytes consumed by
-// the overlayfs upper dir (the writable delta) only.
+// du reports the writable layer disk usage for a fork, broken down into
+// workspace writes and cache writes (npm, pip, cargo). Base image bytes are
+// excluded — only bytes written by this fork since creation are counted.
 //
 // # Usage
 //
-//	fastenv du <fork-id> [--bytes] [--json]
+//	fastenv du <fork-id>
 //
-// # Output modes
+// # Output
 //
-// Default: human-readable size string (e.g. "14 KiB").
-// --bytes: raw byte count (e.g. "14336").
-// --json:  machine-readable JSON object.
+// On success a structured JSON log line is written to stdout:
+//
+//	{
+//	  "fork_id": "agent-1",
+//	  "total_bytes": 12345,
+//	  "workspace_bytes": 10000,
+//	  "cache_bytes": 2345,
+//	  "cache_breakdown": {"pip": 1200, "npm": 1145}
+//	}
 //
 // # Canonical docs
 //
-//   - docs/implementation-plan.md Phase 4 (du)
+//   - docs/implementation-plan.md Phase 4 (du), Phase 5 (shared caches)
 //   - docs/architecture.md §5 OD-4 (quota enforcement)
 package cmd
 
@@ -30,13 +36,6 @@ import (
 )
 
 // newDuCmd returns the cobra command for the du subcommand.
-//
-// du reports the writable layer size delta for a fork, excluding base image
-// bytes.
-//
-// Canonical docs:
-//   - docs/implementation-plan.md Phase 4 (du)
-//   - docs/architecture.md §5 OD-4 (quota enforcement)
 func newDuCmd() *cobra.Command {
 	var (
 		rawBytes bool
@@ -49,12 +48,16 @@ func newDuCmd() *cobra.Command {
 		Long: `Report the disk usage of a fork's writable overlayfs upper layer.
 Base image bytes are excluded — only the delta written by this fork is counted.
 
-By default the size is printed in human-readable IEC format (e.g. "14 KiB").
-Use --bytes for the raw byte count or --json for machine-readable output.
+Cache writes (to /cache/npm, /cache/pip, /cache/cargo) are reported separately
+from workspace writes, so operators can see how much cache the fork has produced
+versus workspace output.
 
-Exit with a descriptive error if:
-  - the fork does not exist or has been discarded
-  - the containerd daemon cannot be reached`,
+On hosts without project quota support this is a measurement-only report.
+Hard quota enforcement requires ext4 or xfs with prjquota enabled.
+
+On success a structured JSON log line is written to stdout:
+
+  {"fork_id":"...","total_bytes":0,"workspace_bytes":0,"cache_bytes":0}`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			forkID := args[0]
@@ -75,9 +78,13 @@ Exit with a descriptive error if:
 					return fmt.Errorf("encode result: %w", err)
 				}
 			case rawBytes:
-				fmt.Fprintf(cmd.OutOrStdout(), "%d\n", result.WritableLayerBytes)
+				fmt.Fprintf(cmd.OutOrStdout(), "%d\n", result.TotalBytes)
 			default:
-				fmt.Fprintf(cmd.OutOrStdout(), "%s\n", result.HumanSize)
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetEscapeHTML(false)
+				if err := enc.Encode(result); err != nil {
+					return fmt.Errorf("encode result: %w", err)
+				}
 			}
 			return nil
 		},
