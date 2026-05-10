@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/superfield-ai/fastenv/internal/logger"
 	"github.com/superfield-ai/fastenv/internal/mounter"
 )
 
@@ -35,7 +36,7 @@ Requires CAP_SYS_ADMIN (run as root or with appropriate privileges).`,
 			if err := mounter.Unmount(forkKey); err != nil {
 				return fmt.Errorf("unmount: %w", err)
 			}
-			log.Info("unmounted", "fork_key", forkKey)
+			log.Info("unmount", "unmounted", logger.Fields{"fork_key": forkKey})
 			return nil
 		},
 	}
