@@ -16,7 +16,10 @@
 //     CacheViewKey(forkID, cacheName) and record the lower dirs.
 //  8. Extend the fork's overlayfs lowerdir option to include the cache lower
 //     dirs so that /cache/<name>/ paths are visible inside the fork.
-//  9. Return structured metadata including creation latency and cache mounts.
+//  9. If a quota is specified, store it as a snapshot label and detect the
+//     enforcement mode (soft or hard).
+//  10. Return structured metadata including creation latency, cache mounts, and
+//     quota mode.
 //
 // # Cache isolation
 //
@@ -36,7 +39,9 @@
 //
 //   - docs/prd.md §7 (shared cache mounts)
 //   - docs/architecture.md §2 (containerd as snapshot manager, shared cache)
-//   - docs/implementation-plan.md Phase 2 (fork), Phase 5 (shared caches)
+//   - docs/architecture.md §5 OD-4 (quota enforcement)
+//   - docs/implementation-plan.md Phase 2 (fork), Phase 5 (shared caches), Phase 5 (quotas)
+//   - docs/quota-prerequisites.md (host filesystem prerequisites)
 //   - docs/scout/phase1-findings.md §1 Phase B (snapshot Prepare for fork)
 package forker
 
@@ -44,6 +49,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +60,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 
 	"github.com/superfield-ai/fastenv/internal/cachemanager"
+	"github.com/superfield-ai/fastenv/internal/quota"
 )
 
 const (
@@ -74,6 +81,9 @@ type Options struct {
 	// Namespace is the containerd namespace to operate in.
 	// Defaults to "fastenv" if empty.
 	Namespace string
+	// QuotaBytes is the per-fork disk quota limit in bytes.
+	// Zero means no quota is set.
+	QuotaBytes int64
 }
 
 // CacheMountInfo describes a single shared cache layer mounted into a fork.
@@ -100,6 +110,14 @@ type ForkResult struct {
 	// CacheMounts lists the shared cache layers mounted read-only into this fork.
 	// Empty when no cache snapshots exist for the base image.
 	CacheMounts []CacheMountInfo `json:"cache_mounts,omitempty"`
+	// QuotaBytes is the per-fork disk quota in bytes, or 0 if no quota was set.
+	// Omitted from JSON when zero.
+	QuotaBytes int64 `json:"quota_bytes,omitempty"`
+	// QuotaMode indicates how the quota is enforced.
+	// "soft": usage is measured and a warning is logged when exceeded.
+	// "hard": writes exceeding the quota fail with EDQUOT (requires prjquota).
+	// Omitted from JSON when no quota is set.
+	QuotaMode quota.Mode `json:"quota_mode,omitempty"`
 }
 
 // Fork creates a writable CoW snapshot identified by forkID from the base
@@ -190,13 +208,19 @@ func Fork(ctx context.Context, baseImage, forkID string, opts Options) (*ForkRes
 	// Labels carry provenance metadata for observability and GC decisions.
 	// fastenv.fork.base: the human-readable base image name.
 	// fastenv.fork.created: RFC 3339 creation timestamp.
+	// fastenv.fork.quota: quota limit in bytes (when set).
 	//
 	// See docs/scout/phase1-findings.md §1 Phase B for the full call sequence.
+	labels := map[string]string{
+		"fastenv.fork.base":    baseImage,
+		"fastenv.fork.created": time.Now().UTC().Format(time.RFC3339),
+	}
+	if opts.QuotaBytes > 0 {
+		labels[quota.LabelKey] = strconv.FormatInt(opts.QuotaBytes, 10)
+	}
+
 	forkMounts, err := sn.Prepare(ctx, forkID, baseSnapshotKey,
-		snapshots.WithLabels(map[string]string{
-			"fastenv.fork.base":    baseImage,
-			"fastenv.fork.created": time.Now().UTC().Format(time.RFC3339),
-		}),
+		snapshots.WithLabels(labels),
 	)
 	if err != nil {
 		if errors.Is(err, cerrdefs.ErrAlreadyExists) {
@@ -253,13 +277,25 @@ func Fork(ctx context.Context, baseImage, forkID string, opts Options) (*ForkRes
 	}
 
 	latency := time.Since(start)
-	return &ForkResult{
+
+	result := &ForkResult{
 		ForkID:          forkID,
 		BaseImage:       baseImage,
 		SnapshotKey:     forkID,
 		CreationLatency: latency.Round(time.Microsecond).String(),
 		CacheMounts:     cacheMountInfos,
-	}, nil
+	}
+
+	// Step 8: Record quota metadata when a limit was requested.
+	//
+	// Detect enforcement mode: soft on most hosts, hard when the containerd
+	// snapshot root filesystem has prjquota enabled (ext4 or xfs).
+	if opts.QuotaBytes > 0 {
+		result.QuotaBytes = opts.QuotaBytes
+		result.QuotaMode = quota.DetectMode(opts.SocketPath)
+	}
+
+	return result, nil
 }
 
 // extractLowerDirs pulls the lowerdir paths out of an overlayfs mount list.
