@@ -27,6 +27,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
 	"github.com/superfield-ai/fastenv/internal/builder"
 )
 
