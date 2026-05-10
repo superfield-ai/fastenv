@@ -4,7 +4,8 @@
 // They do not require a live containerd daemon.
 //
 // Canonical docs:
-//   - docs/implementation-plan.md Phase 4 (du), Phase 5 (shared caches)
+//   - docs/implementation-plan.md Phase 4 (du), Phase 5 (shared caches), Phase 5 (quotas)
+//   - docs/architecture.md §5 OD-4 (quota enforcement)
 package cmd
 
 import (
@@ -59,5 +60,22 @@ func TestDuHelpMentionsCacheBreakdown(t *testing.T) {
 	output := buf.String()
 	if !strings.Contains(output, "cache") {
 		t.Errorf("du --help should mention cache writes; got:\n%s", output)
+	}
+}
+
+// TestDuHelpMentionsQuota verifies that du help text describes quota warning
+// behaviour so users understand the soft/hard distinction.
+func TestDuHelpMentionsQuota(t *testing.T) {
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"du", "--help"})
+	t.Cleanup(func() { rootCmd.SetArgs(nil) })
+
+	_ = rootCmd.Execute()
+
+	output := buf.String()
+	if !strings.Contains(output, "quota") {
+		t.Errorf("du --help should mention quota; got:\n%s", output)
 	}
 }
