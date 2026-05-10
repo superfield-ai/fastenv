@@ -301,9 +301,9 @@ func TestBuildBaseIntegration(t *testing.T) {
 		t.Fatalf("BuildBase (second run): %v", err)
 	}
 	// Second build on unchanged source should produce the same manifest digest
-	// (content-addressed guarantee).
+	// (content-addressed guarantee — acceptance criterion #2).
 	if result.ManifestDigest != result2.ManifestDigest {
-		t.Logf("note: manifest digests differ between runs (expected if config includes timestamps): first=%q second=%q",
+		t.Errorf("manifest digest is not stable across runs: first=%q second=%q",
 			result.ManifestDigest, result2.ManifestDigest)
 	}
 }

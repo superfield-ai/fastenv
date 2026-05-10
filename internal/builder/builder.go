@@ -217,10 +217,16 @@ func createLayer(ctx context.Context, cs content.Store, sourceDir string) (ocisp
 }
 
 // writeConfig builds and persists the OCI Image Config for the given layer.
+//
+// The Created timestamp is pinned to the Unix epoch (1970-01-01T00:00:00Z) so
+// that the config digest — and therefore the manifest digest — is stable for
+// identical input directories.  This satisfies acceptance criterion #2:
+// "Image digest is stable for identical input directories (content-addressed)."
 func writeConfig(ctx context.Context, cs content.Store, diffID digest.Digest) (ocispec.Descriptor, error) {
-	now := time.Now().UTC()
+	// Pin to epoch for deterministic config digest.
+	epoch := time.Unix(0, 0).UTC()
 	cfg := ocispec.Image{
-		Created: &now,
+		Created: &epoch,
 		Author:  "fastenv build-base",
 		Platform: ocispec.Platform{
 			Architecture: runtime.GOARCH,
@@ -232,7 +238,7 @@ func writeConfig(ctx context.Context, cs content.Store, diffID digest.Digest) (o
 		},
 		History: []ocispec.History{
 			{
-				Created:   &now,
+				Created:   &epoch,
 				CreatedBy: "fastenv build-base",
 				Comment:   "ingested from local directory",
 			},
