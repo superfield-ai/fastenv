@@ -1,17 +1,19 @@
 // Package cmd implements the fastenv CLI using cobra.
 //
 // Root command registers all subcommands and wires global flags including the
-// containerd socket path, namespace, and snapshotter driver. Subcommand
-// implementations live in their own files within this package.
+// containerd socket path, namespace, snapshotter driver, and GC policy flags.
+// Subcommand implementations live in their own files within this package.
 //
 // Canonical docs:
 //   - docs/architecture.md §2 (cobra as CLI framework)
 //   - docs/implementation-plan.md Phase 1 (scaffold), Phase 2 (snapshotter)
+//   - docs/implementation-plan.md Phase 6 (GC flags)
 package cmd
 
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -43,6 +45,24 @@ var (
 	//   - docs/architecture.md §2 (pluggable snapshotter)
 	//   - docs/implementation-plan.md Phase 2 (--snapshotter flag)
 	snapshotterName string
+
+	// gcTTL is the maximum age of a fork before it is eligible for TTL-based
+	// GC eviction. Applied on every `fastenv fork`, `fastenv discard`, and
+	// `fastenv gc` invocation. Default: 24h.
+	//
+	// Canonical docs:
+	//   - docs/architecture.md §5 OD-3 (fork GC scheduling)
+	//   - docs/implementation-plan.md Phase 6 (GC)
+	gcTTL time.Duration
+
+	// gcMaxDisk is the total writable-layer disk budget in bytes. When total
+	// usage across all forks exceeds this threshold, LRU eviction kicks in.
+	// Default: 10 GiB (10737418240 bytes).
+	//
+	// Canonical docs:
+	//   - docs/architecture.md §5 OD-3 (fork GC scheduling)
+	//   - docs/implementation-plan.md Phase 6 (GC)
+	gcMaxDisk int64
 )
 
 // rootCmd is the base command that all subcommands are attached to.
@@ -96,6 +116,27 @@ func init() {
 		"snapshotter",
 		"overlayfs",
 		"snapshot driver to use (overlayfs|stargz|nydus)",
+	)
+
+	// --gc-ttl: maximum age of a fork before TTL-based GC eviction.
+	// Applied lazily on every fork/discard invocation and explicitly by
+	// `fastenv gc`. Zero disables TTL eviction (use DefaultTTL as documented).
+	// See docs/architecture.md §5 OD-3 and docs/implementation-plan.md Phase 6.
+	rootCmd.PersistentFlags().DurationVar(
+		&gcTTL,
+		"gc-ttl",
+		24*time.Hour,
+		"fork TTL: evict forks older than this duration (0 = disabled)",
+	)
+
+	// --gc-max-disk: total writable-layer disk budget in bytes. When total
+	// usage exceeds this, LRU eviction removes oldest forks until under budget.
+	// Default: 10 GiB. See docs/architecture.md §5 OD-3.
+	rootCmd.PersistentFlags().Int64Var(
+		&gcMaxDisk,
+		"gc-max-disk",
+		10*1024*1024*1024,
+		"LRU disk budget in bytes: evict oldest forks when total usage exceeds this (default 10GiB)",
 	)
 
 	// Register all subcommands.
