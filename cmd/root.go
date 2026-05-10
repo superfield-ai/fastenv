@@ -187,5 +187,7 @@ func init() {
 		newDiscardCmd(),
 		newGCCmd(),
 		newBenchCmd(),
+		newMountPathCmd(),
+		newUnmountCmd(),
 	)
 }
