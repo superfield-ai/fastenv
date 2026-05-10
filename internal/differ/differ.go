@@ -96,6 +96,48 @@ type Options struct {
 	Namespace string
 }
 
+// UpperDirFromFork connects to containerd and returns the upperdir path for the
+// given forkID active snapshot. It is the lower-level companion to Diff for
+// callers that need the upperdir path in addition to (or instead of) the entry
+// list — for example, to read file content when generating a patch.
+//
+// Returns an error if:
+//   - containerd cannot be reached.
+//   - forkID does not exist as an active snapshot.
+//   - the snapshot is not backed by overlayfs (upperdir not found in mount options).
+func UpperDirFromFork(ctx context.Context, forkID string, opts Options) (string, error) {
+	if opts.SocketPath == "" {
+		opts.SocketPath = "/run/containerd/containerd.sock"
+	}
+	if opts.Namespace == "" {
+		opts.Namespace = "fastenv"
+	}
+
+	client, err := containerd.New(opts.SocketPath,
+		containerd.WithDefaultNamespace(opts.Namespace),
+		containerd.WithTimeout(dialTimeout),
+	)
+	if err != nil {
+		return "", fmt.Errorf("upperdir: dial containerd at %s: %w", opts.SocketPath, err)
+	}
+	defer client.Close()
+
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+
+	sn := client.SnapshotService(snapshotterName)
+	mounts, err := sn.Mounts(ctx, forkID)
+	if err != nil {
+		return "", fmt.Errorf("upperdir: mounts for fork %q: %w", forkID, err)
+	}
+
+	upperDir, err := UpperDir(mounts)
+	if err != nil {
+		return "", fmt.Errorf("upperdir: fork %q: %w", forkID, err)
+	}
+
+	return upperDir, nil
+}
+
 // Diff returns the list of files changed in forkID's overlayfs writable layer.
 //
 // It retrieves the overlay mount descriptors from containerd, extracts the
