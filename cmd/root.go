@@ -1,13 +1,18 @@
 // Package cmd implements the fastenv CLI using cobra.
 //
 // Root command registers all subcommands and wires global flags including the
-// containerd socket path, namespace, snapshotter driver, and GC policy flags.
+// containerd socket path, namespace, snapshotter driver, GC policy flags,
+// and log level.
 // Subcommand implementations live in their own files within this package.
+//
+// Structured JSON logging is emitted to stderr for every CLI operation.
+// The --log-level flag (default: "info") controls verbosity.
 //
 // Canonical docs:
 //   - docs/architecture.md §2 (cobra as CLI framework)
+//   - docs/architecture.md §5 OD-1 (observability tooling)
 //   - docs/implementation-plan.md Phase 1 (scaffold), Phase 2 (snapshotter)
-//   - docs/implementation-plan.md Phase 6 (GC flags)
+//   - docs/implementation-plan.md Phase 6 (GC flags and Observability)
 package cmd
 
 import (
@@ -21,6 +26,8 @@ import (
 	// drivers with the snapshotter registry before any subcommand runs.
 	// New drivers only need to be added here and in their own file.
 	_ "github.com/superfield-ai/fastenv/internal/snapshotter"
+
+	"github.com/superfield-ai/fastenv/internal/logger"
 )
 
 // Global flags shared across all subcommands.
@@ -63,6 +70,15 @@ var (
 	//   - docs/architecture.md §5 OD-3 (fork GC scheduling)
 	//   - docs/implementation-plan.md Phase 6 (GC)
 	gcMaxDisk int64
+
+	// logLevelStr is the raw --log-level flag value (debug|info|warn|error).
+	// Parsed in rootCmd.PersistentPreRunE and stored as the global log instance.
+	logLevelStr string
+
+	// log is the process-wide structured JSON logger, initialized by
+	// rootCmd.PersistentPreRunE from the --log-level flag.
+	// Subcommands call log.Info / log.Debug / log.Warn / log.Error as needed.
+	log *logger.Logger
 )
 
 // rootCmd is the base command that all subcommands are attached to.
@@ -74,6 +90,16 @@ immutable base image using containerd's snapshot API. Agent workspaces
 (forks) are created in ≤100ms p95 with near-zero marginal disk cost.
 
 Complete documentation: https://github.com/superfield-ai/fastenv`,
+	// PersistentPreRunE parses the --log-level flag and initialises the global
+	// JSON logger before any subcommand's RunE is called.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		lvl, err := logger.ParseLevel(logLevelStr)
+		if err != nil {
+			return err
+		}
+		log = logger.New(lvl, cmd.ErrOrStderr())
+		return nil
+	},
 }
 
 // Execute runs the root command. Called from main.go.
@@ -137,6 +163,17 @@ func init() {
 		"gc-max-disk",
 		10*1024*1024*1024,
 		"LRU disk budget in bytes: evict oldest forks when total usage exceeds this (default 10GiB)",
+	)
+
+	// --log-level: controls the minimum severity of structured JSON log lines
+	// emitted to stderr. Levels: debug, info (default), warn, error.
+	// Each CLI operation emits at least one info-level line on success.
+	// See docs/architecture.md §5 OD-1 (observability tooling).
+	rootCmd.PersistentFlags().StringVar(
+		&logLevelStr,
+		"log-level",
+		"info",
+		"minimum log level for structured JSON stderr output (debug|info|warn|error)",
 	)
 
 	// Register all subcommands.
