@@ -1,12 +1,13 @@
 # On-demand benchmark workflow for fastenv.
 #
-# Requires a self-hosted runner with containerd and overlayfs configured.
-# Trigger via: Actions → Bench → Run workflow
+# Runs directly on the self-hosted runner host (no container) so that fastenv
+# can reach the k3s-bundled containerd socket and use the host overlayfs mount
+# namespace. Trigger via: Actions → Bench → Run workflow
 #
 # Inputs:
 #   base_image  — containerd image name to fork from (must be built with `fastenv build-base`)
 #   iterations  — number of fork creation samples per percentile measurement
-#   socket      — containerd socket path (default: /run/containerd/containerd.sock)
+#   socket      — containerd socket path (k3s default: /run/k3s/containerd/containerd.sock)
 name: Bench
 
 on:
@@ -23,12 +24,12 @@ on:
       socket:
         description: "containerd socket path"
         required: false
-        default: "/run/containerd/containerd.sock"
+        default: "/run/k3s/containerd/containerd.sock"
 
 jobs:
   bench:
     name: Benchmark
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
 
