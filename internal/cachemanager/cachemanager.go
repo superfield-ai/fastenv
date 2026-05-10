@@ -236,9 +236,9 @@ func buildCacheLayer(
 	// Commit the scratch snapshot as the canonical cache snapshot.
 	if err := sn.Commit(ctx, snapshotKey, scratchKey,
 		snapshots.WithLabels(map[string]string{
-			gcRootLabel:                 time.Now().UTC().Format(time.RFC3339),
-			"fastenv.cache.name":        cacheName,
-			"fastenv.cache.diff_id":     diffID.String(),
+			gcRootLabel:             time.Now().UTC().Format(time.RFC3339),
+			"fastenv.cache.name":    cacheName,
+			"fastenv.cache.diff_id": diffID.String(),
 		}),
 	); err != nil {
 		_ = sn.Remove(ctx, scratchKey)
@@ -435,7 +435,7 @@ func MountCacheLayer(
 
 	mounts, err := sn.View(ctx, viewKey, cacheKey,
 		snapshots.WithLabels(map[string]string{
-			"fastenv.fork.id":   forkID,
+			"fastenv.fork.id":    forkID,
 			"fastenv.cache.name": cacheName,
 		}),
 	)

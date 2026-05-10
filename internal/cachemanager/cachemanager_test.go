@@ -10,6 +10,7 @@
 package cachemanager_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,10 +82,10 @@ func TestIsCachePath(t *testing.T) {
 
 	nonCachePaths := []string{
 		"src/main.go",
-		"src/cache/pip",         // not at root
-		"workspace/cache/pip",   // not at root
-		"cache",                 // the root cache dir itself — not a managed path
-		"cache/other",           // not a known cache name
+		"src/cache/pip",       // not at root
+		"workspace/cache/pip", // not at root
+		"cache",               // the root cache dir itself — not a managed path
+		"cache/other",         // not a known cache name
 		"/home/user/.npmrc",
 		"",
 		".",
@@ -123,7 +124,7 @@ func TestBuildCacheLayers_SkipsMissing(t *testing.T) {
 	// We pass nil for cs and sn; if the function tries to use them for any
 	// absent-but-not-skipped path, it will panic (desired: we want to confirm
 	// absent dirs are skipped before any storage calls).
-	result, err := cachemanager.BuildCacheLayers(nil, nil, nil, sourceDir, "test-image", nil)
+	result, err := cachemanager.BuildCacheLayers(context.TODO(), nil, nil, sourceDir, "test-image", nil)
 	if err != nil {
 		t.Fatalf("BuildCacheLayers with no cache dirs: %v", err)
 	}
@@ -166,5 +167,5 @@ func TestBuildCacheLayers_DetectsCacheDirs(t *testing.T) {
 		}
 	}()
 
-	_, _ = cachemanager.BuildCacheLayers(nil, nil, nil, sourceDir, "test-image", nil)
+	_, _ = cachemanager.BuildCacheLayers(context.TODO(), nil, nil, sourceDir, "test-image", nil)
 }
