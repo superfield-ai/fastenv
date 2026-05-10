@@ -35,6 +35,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/superfield-ai/fastenv/internal/discarder"
+	"github.com/superfield-ai/fastenv/internal/gcer"
 )
 
 // newDiscardCmd returns the cobra command for the discard subcommand.
@@ -84,6 +85,18 @@ docs/scout/phase1-findings.md for the task delete / snapshot remove order.`,
 			if err := enc.Encode(result); err != nil {
 				return fmt.Errorf("encode result: %w", err)
 			}
+
+			// Lazy GC: run TTL/LRU eviction on every discard invocation.
+			// Errors are intentionally ignored: GC failure must not fail the discard.
+			// Eviction log lines go to stderr so they don't pollute stdout JSON.
+			_, _ = gcer.RunGC(cmd.Context(), gcer.Options{
+				SocketPath: containerdSocket,
+				Namespace:  containerdNamespace,
+				TTL:        gcTTL,
+				MaxDisk:    gcMaxDisk,
+				Out:        cmd.ErrOrStderr(),
+			})
+
 			return nil
 		},
 	}

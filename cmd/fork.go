@@ -40,6 +40,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/superfield-ai/fastenv/internal/forker"
+	"github.com/superfield-ai/fastenv/internal/gcer"
 	"github.com/superfield-ai/fastenv/internal/quota"
 )
 
@@ -111,6 +112,18 @@ Exit with a descriptive error if:
 			if err := enc.Encode(result); err != nil {
 				return fmt.Errorf("encode result: %w", err)
 			}
+
+			// Lazy GC: run TTL/LRU eviction on every fork invocation.
+			// Errors are intentionally ignored: GC failure must not fail the fork.
+			// Eviction log lines go to stderr so they don't pollute stdout JSON.
+			_, _ = gcer.RunGC(cmd.Context(), gcer.Options{
+				SocketPath: containerdSocket,
+				Namespace:  containerdNamespace,
+				TTL:        gcTTL,
+				MaxDisk:    gcMaxDisk,
+				Out:        cmd.ErrOrStderr(),
+			})
+
 			return nil
 		},
 	}
