@@ -16,7 +16,8 @@
 //  7. Delete the task (cleans up the shim and cgroups; the snapshot is NOT
 //     removed — snapshot lifetime is managed separately via fastenv discard).
 //  8. Delete the container object.
-//  9. Emit a structured JSON log line: fork ID, command, exit code, duration.
+//  9. Emit a structured JSON log line: fork ID, command, exit code, duration,
+//     and network mode.
 //
 // The container object and task are ephemeral; they exist only for the
 // duration of the exec invocation. The fork's snapshot is preserved so
@@ -27,6 +28,15 @@
 // CPU limits are expressed as CPU shares (relative weight) when --cpu is given
 // as an integer, or as a cpuset string (e.g. "0-1") when it contains a hyphen
 // or comma. Memory limits are in bytes passed via --memory.
+//
+// # Network isolation
+//
+// Two network modes are supported:
+//   - NetworkNone (default): a fresh network namespace is created for the fork
+//     with only a loopback interface. The fork cannot reach external networks.
+//     No CNI plugin or external binary is required.
+//   - NetworkHost: the fork shares the host's network namespace (legacy
+//     behaviour). No network namespace is added to the OCI spec.
 //
 // # crun path
 //
@@ -54,6 +64,20 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+)
+
+// NetworkMode controls how the fork's network namespace is configured.
+type NetworkMode string
+
+const (
+	// NetworkNone creates a new network namespace for the fork's process with
+	// only a loopback interface. The fork has no external network reachability.
+	// This is the default and requires no CNI plugin or external binary.
+	NetworkNone NetworkMode = "none"
+
+	// NetworkHost shares the host network namespace with the fork's process.
+	// Use this when the exec'd command needs to reach external networks.
+	NetworkHost NetworkMode = "host"
 )
 
 const (
@@ -87,6 +111,10 @@ type Options struct {
 	WorkDir string
 	// Env is a list of additional environment variables (KEY=VALUE) to pass.
 	Env []string
+	// Network controls whether the fork gets an isolated network namespace
+	// (NetworkNone, the default) or shares the host's network namespace
+	// (NetworkHost). Defaults to NetworkNone if empty.
+	Network NetworkMode
 }
 
 // ExecResult holds metadata about the completed exec, emitted as a structured
@@ -100,6 +128,8 @@ type ExecResult struct {
 	ExitCode int `json:"exit_code"`
 	// Duration is the wall-clock time from task start to exit.
 	Duration string `json:"duration"`
+	// NetworkMode is the network isolation mode used for this exec.
+	NetworkMode NetworkMode `json:"network_mode"`
 }
 
 // Exec runs cmd inside the named fork's isolated mount and PID namespaces.
@@ -122,6 +152,12 @@ func Exec(ctx context.Context, forkID string, cmd []string, opts Options) (*Exec
 	}
 	if opts.WorkDir == "" {
 		opts.WorkDir = "/"
+	}
+	if opts.Network == "" {
+		opts.Network = NetworkNone
+	}
+	if opts.Network != NetworkNone && opts.Network != NetworkHost {
+		return nil, fmt.Errorf("exec: --network must be %q or %q, got %q", NetworkNone, NetworkHost, opts.Network)
 	}
 	if len(cmd) == 0 {
 		return nil, fmt.Errorf("exec: command must not be empty")
@@ -208,18 +244,22 @@ func Exec(ctx context.Context, forkID string, cmd []string, opts Options) (*Exec
 	}
 
 	return &ExecResult{
-		ForkID:   forkID,
-		Command:  cmd,
-		ExitCode: int(exitStatus.ExitCode()),
-		Duration: duration.Round(time.Millisecond).String(),
+		ForkID:      forkID,
+		Command:     cmd,
+		ExitCode:    int(exitStatus.ExitCode()),
+		Duration:    duration.Round(time.Millisecond).String(),
+		NetworkMode: opts.Network,
 	}, nil
 }
 
 // buildSpecOpts constructs the OCI SpecOpts slice from cmd and Options.
 //
 // The spec uses isolated mount and PID namespaces as required by the issue.
-// Network is shared with the host (no --network=none flag in v1) to allow
-// the exec'd command to reach the network as an AI agent would expect.
+// When opts.Network is NetworkNone (default), a new network namespace is
+// created for the fork with only a loopback interface — no CNI plugin or
+// external binary is required; crun handles lo setup automatically.
+// When opts.Network is NetworkHost the network namespace entry is omitted so
+// the fork shares the host network stack.
 // User namespace is omitted to keep v1 simple (requires root / CAP_SYS_ADMIN).
 func buildSpecOpts(cmd []string, opts Options) []oci.SpecOpts {
 	sopts := []oci.SpecOpts{
@@ -231,6 +271,15 @@ func buildSpecOpts(cmd []string, opts Options) []oci.SpecOpts {
 		oci.WithProcessArgs(cmd...),
 		// Working directory inside the container.
 		oci.WithProcessCwd(opts.WorkDir),
+	}
+
+	// Network namespace isolation.
+	// NetworkNone (default): add a new network namespace with no path — crun
+	// creates a fresh netns with only lo. No CNI plugin needed.
+	// NetworkHost: omit the network namespace entry so the fork inherits the
+	// host's network stack (existing behaviour before this flag was added).
+	if opts.Network == NetworkNone {
+		sopts = append(sopts, oci.WithLinuxNamespace(specs.LinuxNamespace{Type: specs.NetworkNamespace}))
 	}
 
 	// Default PATH so simple commands (pytest, bash, python) resolve without
