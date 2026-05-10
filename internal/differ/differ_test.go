@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/mount"
+
 	"github.com/superfield-ai/fastenv/internal/differ"
 )
 
