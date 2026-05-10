@@ -7,10 +7,10 @@
 //  2. For each active snapshot that carries a "fastenv.fork.created" label
 //     (i.e. a fork created by `fastenv fork`), apply the TTL and LRU policies:
 //     - TTL: if the fork's creation timestamp is older than gcTTL, mark for
-//       eviction with reason "ttl".
+//     eviction with reason "ttl".
 //     - LRU: if total writable-layer disk usage exceeds gcMaxDisk, evict the
-//       least-recently-used forks (oldest first) until usage is below the
-//       threshold, marking each with reason "lru".
+//     least-recently-used forks (oldest first) until usage is below the
+//     threshold, marking each with reason "lru".
 //  3. Skip forks that are currently executing (reserved for future: a running
 //     task label could be checked; for now we rely on containerd returning an
 //     error on Remove if the snapshot is in use).
