@@ -135,13 +135,13 @@ Exit with a descriptive error if:
 			// Best-effort: skip warning if the label cannot be read (e.g. no
 			// quota was set, or containerd is temporarily unavailable).
 			quotaBytes, err := snapshotQuotaLabel(containerdSocket, containerdNamespace, forkID)
-			if err == nil && quotaBytes > 0 && result.WritableLayerBytes > quotaBytes {
+			if err == nil && quotaBytes > 0 && result.TotalBytes > quotaBytes {
 				warn := duWarning{
 					Level:        "warn",
 					ForkID:       forkID,
-					UsageBytes:   result.WritableLayerBytes,
+					UsageBytes:   result.TotalBytes,
 					QuotaBytes:   quotaBytes,
-					OverageBytes: result.WritableLayerBytes - quotaBytes,
+					OverageBytes: result.TotalBytes - quotaBytes,
 				}
 				warnEnc := json.NewEncoder(cmd.ErrOrStderr())
 				warnEnc.SetEscapeHTML(false)
