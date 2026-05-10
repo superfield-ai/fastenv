@@ -1,0 +1,72 @@
+# On-demand benchmark workflow for fastenv.
+#
+# Requires a self-hosted runner with containerd and overlayfs configured.
+# Trigger via: Actions → Bench → Run workflow
+#
+# Inputs:
+#   base_image  — containerd image name to fork from (must be built with `fastenv build-base`)
+#   iterations  — number of fork creation samples per percentile measurement
+#   socket      — containerd socket path (default: /run/containerd/containerd.sock)
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Base image name (must exist on the runner)"
+        required: false
+        default: "fastenv-bench-base"
+      iterations:
+        description: "Benchmark iterations"
+        required: false
+        default: "50"
+      socket:
+        description: "containerd socket path"
+        required: false
+        default: "/run/containerd/containerd.sock"
+
+jobs:
+  bench:
+    name: Benchmark
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build fastenv
+        run: go build -o fastenv .
+
+      - name: Run benchmark
+        id: bench
+        run: |
+          sudo ./fastenv bench \
+            --base "${{ inputs.base_image }}" \
+            --socket "${{ inputs.socket }}" \
+            --iterations "${{ inputs.iterations }}" \
+            | tee bench-results.json
+
+      - name: Check PRD latency targets
+        run: |
+          P50=$(jq '.fork_creation.latency.p50_ms' bench-results.json)
+          P95=$(jq '.fork_creation.latency.p95_ms' bench-results.json)
+          MEETS_P50=$(jq '.fork_creation.meets_budget_p50' bench-results.json)
+          MEETS_P95=$(jq '.fork_creation.meets_budget_p95' bench-results.json)
+
+          echo "Fork creation p50: ${P50}ms (target ≤50ms) — meets: ${MEETS_P50}"
+          echo "Fork creation p95: ${P95}ms (target ≤100ms) — meets: ${MEETS_P95}"
+
+          if [ "$MEETS_P95" = "false" ]; then
+            echo "::warning::Fork creation p95 ${P95}ms exceeds 100ms PRD target"
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: bench-results.json
+          retention-days: 90
