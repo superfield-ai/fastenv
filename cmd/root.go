@@ -1,12 +1,12 @@
 // Package cmd implements the fastenv CLI using cobra.
 //
 // Root command registers all subcommands and wires global flags including the
-// containerd socket path and namespace. Subcommand implementations live in
-// their own files within this package.
+// containerd socket path, namespace, and snapshotter driver. Subcommand
+// implementations live in their own files within this package.
 //
 // Canonical docs:
 //   - docs/architecture.md §2 (cobra as CLI framework)
-//   - docs/implementation-plan.md Phase 1 (scaffold)
+//   - docs/implementation-plan.md Phase 1 (scaffold), Phase 2 (snapshotter)
 package cmd
 
 import (
@@ -14,6 +14,11 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	// Blank-import driver packages so their init() functions register the
+	// drivers with the snapshotter registry before any subcommand runs.
+	// New drivers only need to be added here and in their own file.
+	_ "github.com/superfield-ai/fastenv/internal/snapshotter"
 )
 
 // Global flags shared across all subcommands.
@@ -27,6 +32,17 @@ var (
 	// Using a dedicated namespace avoids collisions with Docker / CRI containers.
 	// See docs/scout/phase1-findings.md §7 (integration point: namespace isolation).
 	containerdNamespace string
+
+	// snapshotterName selects the snapshot driver used for all fork and base
+	// operations. Must be a driver registered in the snapshotter package.
+	// Supported values: overlayfs (default), stargz, nydus.
+	// Selecting an unimplemented driver returns a clear error on first use
+	// rather than panicking.
+	//
+	// Canonical docs:
+	//   - docs/architecture.md §2 (pluggable snapshotter)
+	//   - docs/implementation-plan.md Phase 2 (--snapshotter flag)
+	snapshotterName string
 )
 
 // rootCmd is the base command that all subcommands are attached to.
@@ -67,6 +83,19 @@ func init() {
 		"namespace",
 		"fastenv",
 		"containerd namespace (env: CONTAINERD_NAMESPACE)",
+	)
+
+	// --snapshotter: selects the snapshot driver for fork and base operations.
+	// Defaults to "overlayfs" (the only fully implemented driver in v1).
+	// Choosing "stargz" or "nydus" will surface a clear ErrNotImplemented
+	// error rather than panicking. This satisfies the acceptance criterion:
+	//   "Swapping --snapshotter to an unimplemented value returns a clear
+	//    error rather than a panic."
+	rootCmd.PersistentFlags().StringVar(
+		&snapshotterName,
+		"snapshotter",
+		"overlayfs",
+		"snapshot driver to use (overlayfs|stargz|nydus)",
 	)
 
 	// Register all subcommands.
