@@ -18,7 +18,7 @@
 //     dirs so that /cache/<name>/ paths are visible inside the fork.
 //  9. If a quota is specified, store it as a snapshot label and detect the
 //     enforcement mode (soft or hard).
-// 10. Return structured metadata including creation latency, cache mounts, and
+//  10. Return structured metadata including creation latency, cache mounts, and
 //     quota mode.
 //
 // # Cache isolation
