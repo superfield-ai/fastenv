@@ -1,0 +1,17 @@
+[package]
+name = "fastenv"
+version = "0.1.0"
+edition = "2021"
+description = "OCI-native copy-on-write workspace forking for AI agent orchestration"
+repository = "https://github.com/superfield-ai/fastenv"
+
+[[bin]]
+name = "fastenv"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+serde_json = "1"
+anyhow = "1"

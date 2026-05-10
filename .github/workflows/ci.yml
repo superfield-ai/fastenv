@@ -2,8 +2,11 @@
 #
 # Runs on every push and pull request to main.
 # Jobs:
-#   lint  — golangci-lint with the project .golangci.yml config
-#   build — go build ./... to verify compilation
+#   lint      — golangci-lint with the project .golangci.yml config
+#   build     — go build ./... to verify compilation
+#   rust-fmt  — cargo fmt --check
+#   rust-lint — cargo clippy --deny warnings
+#   rust-test — cargo test
 #
 # Integration tests that require a live containerd daemon are skipped
 # gracefully when containerd is not available (via testutil.RequireContainerd).
@@ -54,3 +57,49 @@ jobs:
 
       - name: Test (unit, no containerd required)
         run: go test ./... -count=1 -timeout=60s
+
+  rust-fmt:
+    name: Rust fmt
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  rust-lint:
+    name: Rust clippy
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install crun
+        run: sudo apt-get install -y crun
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+  rust-test:
+    name: Rust test
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install crun
+        run: sudo apt-get install -y crun
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test
