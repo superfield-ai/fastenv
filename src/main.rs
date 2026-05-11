@@ -13,6 +13,7 @@ pub mod exec;
 pub mod export_patch;
 pub mod fork;
 pub mod gc;
+pub mod mount_path;
 pub mod quota;
 pub mod registry;
 
@@ -199,10 +200,10 @@ fn main() -> Result<()> {
             gc::run_gc(&cli.root, &opts)?;
         }
         Commands::MountPath { fork_id } => {
-            tracing::info!(command = "mount-path", fork_id = %fork_id, "not yet implemented");
+            mount_path::mount_path(&fork_id, &cli.root)?;
         }
         Commands::Unmount { fork_id } => {
-            tracing::info!(command = "unmount", fork_id = %fork_id, "not yet implemented");
+            mount_path::unmount_fork(&fork_id, &cli.root)?;
         }
         Commands::Bench { iterations } => {
             tracing::info!(command = "bench", iterations, "not yet implemented");
