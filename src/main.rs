@@ -7,6 +7,7 @@
 
 pub mod build_base;
 pub mod discard;
+pub mod exec;
 pub mod fork;
 pub mod registry;
 
@@ -57,6 +58,18 @@ enum Commands {
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, num_args = 1..)]
         command: Vec<String>,
+        /// Path to the crun binary
+        #[arg(long, default_value = "/usr/bin/crun")]
+        crun_path: String,
+        /// CPU constraint: integer → cpu_shares, string with '-' or ',' → cpuset
+        #[arg(long)]
+        cpu: Option<String>,
+        /// Memory limit in bytes (e.g. 67108864 for 64 MiB)
+        #[arg(long)]
+        memory: Option<u64>,
+        /// Network mode: 'none' for isolated, 'host' for host networking
+        #[arg(long)]
+        network: Option<String>,
     },
     /// Show a unified diff of changes made inside a fork.
     Diff {
@@ -118,8 +131,23 @@ fn main() -> Result<()> {
         Commands::Discard { fork_id } => {
             discard::discard_fork(&fork_id, &cli.root)?;
         }
-        Commands::Exec { fork_id, command } => {
-            tracing::info!(command = "exec", fork_id = %fork_id, exec_command = ?command, "not yet implemented");
+        Commands::Exec {
+            fork_id,
+            command,
+            crun_path,
+            cpu,
+            memory,
+            network,
+        } => {
+            let cpu_spec = cpu.as_deref().map(exec::parse_cpu_spec).transpose()?;
+            let opts = exec::ExecOptions {
+                crun_path,
+                cpu: cpu_spec,
+                memory,
+                network,
+            };
+            let exit_code = exec::run_exec(&fork_id, &command, &cli.root, &opts)?;
+            std::process::exit(exit_code);
         }
         Commands::Diff { fork_id } => {
             tracing::info!(command = "diff", fork_id = %fork_id, "not yet implemented");
