@@ -137,8 +137,7 @@ fn is_mounted(path: &Path) -> Result<bool> {
     let path_str = path
         .to_str()
         .with_context(|| format!("mount path is not valid UTF-8: {}", path.display()))?;
-    let mounts = fs::read_to_string("/proc/mounts")
-        .context("cannot read /proc/mounts")?;
+    let mounts = fs::read_to_string("/proc/mounts").context("cannot read /proc/mounts")?;
     Ok(mounts.lines().any(|line| {
         // Each line: device mountpoint fs options dump pass
         let mut fields = line.split_whitespace();
@@ -159,7 +158,11 @@ mod tests {
 
     use crate::registry::{BaseEntry, ForkEntry, QuotaMode, Registry};
 
-    fn make_fork_entry(base_key: &str, upper: std::path::PathBuf, work: std::path::PathBuf) -> ForkEntry {
+    fn make_fork_entry(
+        base_key: &str,
+        upper: std::path::PathBuf,
+        work: std::path::PathBuf,
+    ) -> ForkEntry {
         ForkEntry {
             base_key: base_key.to_owned(),
             upper_path: upper,
@@ -219,7 +222,10 @@ mod tests {
             )
             .unwrap();
         registry
-            .insert_fork("agent-1", make_fork_entry("mybase", upper.clone(), work.clone()))
+            .insert_fork(
+                "agent-1",
+                make_fork_entry("mybase", upper.clone(), work.clone()),
+            )
             .unwrap();
 
         // Discard.
