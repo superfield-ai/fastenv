@@ -9,6 +9,8 @@
 // that emit a structured JSON log line and exit 0. Business logic is added in
 // subsequent implementation issues.
 
+pub mod registry;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
