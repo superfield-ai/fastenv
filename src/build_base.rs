@@ -65,7 +65,7 @@ pub fn build_base(source_dir: &Path, base_key: &str, root: &Path) -> Result<()> 
     let registry = Registry::open(root)?;
     if registry.get_base(base_key).is_ok() {
         tracing::info!(
-            command  = "build-base",
+            command = "build-base",
             base_key = base_key,
             "base already exists — skipping re-extraction"
         );
@@ -177,8 +177,8 @@ fn build_gzip_tar(dir: &Path) -> Result<Vec<u8>> {
 /// Directories themselves are also included so that empty dirs are preserved.
 fn collect_entries(root: &Path, current: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut result = Vec::new();
-    for entry in fs::read_dir(current)
-        .with_context(|| format!("cannot read dir {}", current.display()))?
+    for entry in
+        fs::read_dir(current).with_context(|| format!("cannot read dir {}", current.display()))?
     {
         let entry = entry?;
         let abs = entry.path();
@@ -271,13 +271,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         build_base(src.path(), "mybase", root.path()).expect("build_base failed");
 
-        let meta_path = root
-            .path()
-            .join("bases")
-            .join("mybase")
-            .join("meta.json");
-        let meta: BaseMeta =
-            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let meta_path = root.path().join("bases").join("mybase").join("meta.json");
+        let meta: BaseMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
 
         // Digest is "sha256:<hex>".
         let hex_part = meta.layer_digest.strip_prefix("sha256:").unwrap();
@@ -338,13 +333,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         build_base(src.path(), "mybase", root.path()).expect("build_base failed");
 
-        let meta_path = root
-            .path()
-            .join("bases")
-            .join("mybase")
-            .join("meta.json");
-        let meta: BaseMeta =
-            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        let meta_path = root.path().join("bases").join("mybase").join("meta.json");
+        let meta: BaseMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
         let hex_part = meta.layer_digest.strip_prefix("sha256:").unwrap();
         let blob_path = root
             .path()
@@ -355,8 +345,7 @@ mod tests {
 
         let blob_bytes = fs::read(&blob_path).unwrap();
         let extract_dir = TempDir::new().unwrap();
-        let mut archive =
-            tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(blob_bytes)));
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(blob_bytes)));
         archive.unpack(extract_dir.path()).unwrap();
 
         assert!(
