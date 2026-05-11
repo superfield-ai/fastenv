@@ -245,6 +245,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "linux-raw-sys",
  "rustix",
  "serde",
  "serde_json",
