@@ -6,6 +6,7 @@
 //   - docs/implementation-plan.md
 
 pub mod build_base;
+pub mod discard;
 pub mod fork;
 pub mod registry;
 
@@ -115,7 +116,7 @@ fn main() -> Result<()> {
             fork::fork_base(&base, &name, &cli.root)?;
         }
         Commands::Discard { fork_id } => {
-            tracing::info!(command = "discard", fork_id = %fork_id, "not yet implemented");
+            discard::discard_fork(&fork_id, &cli.root)?;
         }
         Commands::Exec { fork_id, command } => {
             tracing::info!(command = "exec", fork_id = %fork_id, exec_command = ?command, "not yet implemented");
