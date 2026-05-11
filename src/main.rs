@@ -12,10 +12,11 @@ pub mod du;
 pub mod exec;
 pub mod export_patch;
 pub mod fork;
+pub mod gc;
 pub mod quota;
 pub mod registry;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -100,7 +101,20 @@ enum Commands {
         output: Option<PathBuf>,
     },
     /// Garbage-collect stale or orphaned forks and snapshots.
-    Gc,
+    Gc {
+        /// Maximum age of a fork before it is evicted (e.g. "24h", "30m", "0s").
+        /// Forks older than this value are eviction candidates.
+        /// Default: "24h".
+        #[arg(long, default_value = "24h")]
+        max_age: String,
+        /// Maximum number of forks to retain.  When the live count exceeds this,
+        /// the oldest forks are evicted first.
+        #[arg(long)]
+        max_forks: Option<usize>,
+        /// Print eviction candidates without performing any removals.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Print the host mount path for an active fork's overlayfs.
     MountPath {
         /// Fork identifier
@@ -170,8 +184,19 @@ fn main() -> Result<()> {
         Commands::ExportPatch { fork_id, output } => {
             export_patch::export_patch(&fork_id, &cli.root, output.as_deref())?;
         }
-        Commands::Gc => {
-            tracing::info!(command = "gc", "not yet implemented");
+        Commands::Gc {
+            max_age,
+            max_forks,
+            dry_run,
+        } => {
+            let max_age_duration = gc::parse_duration(&max_age)
+                .with_context(|| format!("invalid --max-age value: '{}'", max_age))?;
+            let opts = gc::GcOptions {
+                max_age: Some(max_age_duration),
+                max_forks,
+                dry_run,
+            };
+            gc::run_gc(&cli.root, &opts)?;
         }
         Commands::MountPath { fork_id } => {
             tracing::info!(command = "mount-path", fork_id = %fork_id, "not yet implemented");
