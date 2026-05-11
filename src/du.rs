@@ -145,8 +145,7 @@ pub fn walk_upper_bytes(upper_dir: &Path) -> Result<u64> {
 }
 
 fn walk_dir(dir: &Path, total: &mut u64) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("read_dir: {}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read_dir: {}", dir.display()))?;
 
     for entry in entries {
         let entry = entry.with_context(|| format!("read dir entry in {}", dir.display()))?;
@@ -391,7 +390,7 @@ mod tests {
     #[test]
     fn du_output_overage_bytes_computed() {
         let usage: u64 = 1048576; // 1 MiB
-        let quota: u64 = 524288;  // 512 KiB
+        let quota: u64 = 524288; // 512 KiB
 
         let output = DuOutput {
             fork_id: "agent-1".to_owned(),
@@ -419,8 +418,14 @@ mod tests {
             overage_bytes: None,
         };
         let json = serde_json::to_string(&output).unwrap();
-        assert!(!json.contains("quota_bytes"), "quota_bytes must be absent when not set");
-        assert!(!json.contains("overage_bytes"), "overage_bytes must be absent when not set");
+        assert!(
+            !json.contains("quota_bytes"),
+            "quota_bytes must be absent when not set"
+        );
+        assert!(
+            !json.contains("overage_bytes"),
+            "overage_bytes must be absent when not set"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -437,7 +442,13 @@ mod tests {
             overage_bytes: Some(1000),
         };
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"quota_bytes\":1000"), "quota_bytes must be present");
-        assert!(json.contains("\"overage_bytes\":1000"), "overage_bytes must be present");
+        assert!(
+            json.contains("\"quota_bytes\":1000"),
+            "quota_bytes must be present"
+        );
+        assert!(
+            json.contains("\"overage_bytes\":1000"),
+            "overage_bytes must be present"
+        );
     }
 }
