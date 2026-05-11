@@ -6,6 +6,7 @@
 //   - docs/implementation-plan.md
 
 pub mod build_base;
+pub mod diff;
 pub mod discard;
 pub mod exec;
 pub mod fork;
@@ -150,7 +151,7 @@ fn main() -> Result<()> {
             std::process::exit(exit_code);
         }
         Commands::Diff { fork_id } => {
-            tracing::info!(command = "diff", fork_id = %fork_id, "not yet implemented");
+            diff::diff_fork(&fork_id, &cli.root)?;
         }
         Commands::Du { fork_id } => {
             tracing::info!(command = "du", fork_id = %fork_id, "not yet implemented");
