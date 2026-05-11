@@ -87,8 +87,8 @@ pub fn run_gc(root: &Path, opts: &GcOptions) -> Result<()> {
 
     // 2a. TTL policy: evict forks older than max_age.
     if let Some(max_age) = opts.max_age {
-        let max_age_chrono = chrono::Duration::from_std(max_age)
-            .unwrap_or(chrono::Duration::zero());
+        let max_age_chrono =
+            chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::zero());
         for (key, ts) in &forks_with_time {
             let age = now.signed_duration_since(*ts);
             if age >= max_age_chrono {
@@ -256,18 +256,12 @@ mod tests {
 
     #[test]
     fn parse_duration_seconds() {
-        assert_eq!(
-            parse_duration("0s").unwrap(),
-            std::time::Duration::ZERO
-        );
+        assert_eq!(parse_duration("0s").unwrap(), std::time::Duration::ZERO);
     }
 
     #[test]
     fn parse_duration_zero_bare() {
-        assert_eq!(
-            parse_duration("0").unwrap(),
-            std::time::Duration::ZERO
-        );
+        assert_eq!(parse_duration("0").unwrap(), std::time::Duration::ZERO);
     }
 
     #[test]
