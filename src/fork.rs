@@ -451,8 +451,7 @@ mod tests {
         }
         let lowerdir_str = lower_dirs.join(":");
         assert_eq!(
-            lowerdir_str,
-            "/var/lib/fastenv/bases/mybase/lower",
+            lowerdir_str, "/var/lib/fastenv/bases/mybase/lower",
             "single-lower lowerdir must not contain a colon"
         );
     }

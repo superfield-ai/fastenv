@@ -125,11 +125,7 @@ pub fn build_base(source_dir: &Path, base_key: &str, root: &Path) -> Result<()> 
     for &name in KNOWN_CACHE_NAMES {
         let cache_source_dir = cache_source_root.join(name);
         if cache_source_dir.is_dir() {
-            let cache_lower_dir = root
-                .join("bases")
-                .join(base_key)
-                .join("cache")
-                .join(name);
+            let cache_lower_dir = root.join("bases").join(base_key).join("cache").join(name);
             fs::create_dir_all(&cache_lower_dir).with_context(|| {
                 format!(
                     "cannot create cache lower dir: {}",
@@ -155,9 +151,9 @@ pub fn build_base(source_dir: &Path, base_key: &str, root: &Path) -> Result<()> 
             cache_lower_paths.push(cache_lower_dir);
             cache_names.push(name.to_owned());
             tracing::info!(
-                command  = "build-base",
+                command = "build-base",
                 base_key = base_key,
-                cache    = name,
+                cache = name,
                 "cache subdir detected and extracted"
             );
         }
