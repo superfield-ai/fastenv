@@ -123,9 +123,13 @@ struct LockGuard {
 
 impl LockGuard {
     fn acquire(lock_path: &Path) -> Result<Self> {
+        // The lock file is never written to; we only flock(2) it.
+        // `.truncate(false)` suppresses the clippy::suspicious_open_options
+        // lint that fires when `.create(true)` is used without `.truncate(...)`.
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         flock(&file, FlockOperation::LockExclusive)
             .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
@@ -346,7 +350,12 @@ mod tests {
         }
 
         let forks = reg.list_forks().unwrap();
-        assert_eq!(forks.len(), 8, "expected 8 fork entries, got {}", forks.len());
+        assert_eq!(
+            forks.len(),
+            8,
+            "expected 8 fork entries, got {}",
+            forks.len()
+        );
         for i in 0..8u32 {
             assert!(forks.contains_key(&format!("fork-{}", i)));
         }
@@ -378,8 +387,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let reg = Registry::open(dir.path()).unwrap();
 
-        reg.insert_base("ubuntu-22", make_base_entry("ubuntu-22")).unwrap();
-        reg.insert_fork("my-fork", make_fork_entry("ubuntu-22", "my-fork")).unwrap();
+        reg.insert_base("ubuntu-22", make_base_entry("ubuntu-22"))
+            .unwrap();
+        reg.insert_fork("my-fork", make_fork_entry("ubuntu-22", "my-fork"))
+            .unwrap();
 
         let forks = reg.list_forks().unwrap();
         assert_eq!(forks.len(), 1);
@@ -421,7 +432,8 @@ mod tests {
 
         for i in 0..5u32 {
             let key = format!("fork-{}", i);
-            reg.insert_fork(&key, make_fork_entry("base", &key)).unwrap();
+            reg.insert_fork(&key, make_fork_entry("base", &key))
+                .unwrap();
         }
 
         let forks = reg.list_forks().unwrap();
