@@ -243,6 +243,7 @@ mod tests {
                     lower_path: lower.clone(),
                     meta_path: root.join("bases/mybase/meta.json"),
                     created_at: "2026-01-01T00:00:00Z".to_owned(),
+                    cache_lower_paths: vec![],
                 },
             )
             .unwrap();

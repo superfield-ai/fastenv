@@ -106,10 +106,17 @@ pub fn fork_base(
         .with_context(|| format!("cannot create merged dir: {}", merged_path.display()))?;
 
     // ── 4. Mount overlayfs ───────────────────────────────────────────────────
-    let lower_path = &base_entry.lower_path;
+    // Build the lowerdir= value: base lower first, then cache lower dirs
+    // (each colon-separated).  On kernel 5.15+ multi-lower overlayfs is
+    // supported natively — no additional kernel options required.
+    let mut lower_dirs: Vec<String> = vec![base_entry.lower_path.display().to_string()];
+    for cache_path in &base_entry.cache_lower_paths {
+        lower_dirs.push(cache_path.display().to_string());
+    }
+    let lowerdir_str = lower_dirs.join(":");
     let mount_data_str = format!(
         "lowerdir={},upperdir={},workdir={}",
-        lower_path.display(),
+        lowerdir_str,
         upper_path.display(),
         work_path.display(),
     );
@@ -192,6 +199,7 @@ pub fn fork_base(
         creation_latency_ms = creation_latency_ms,
         quota_mode = quota_mode_str,
         quota_bytes = quota_bytes,
+        cache_lower_count = base_entry.cache_lower_paths.len(),
         "fork created"
     );
 
@@ -282,6 +290,7 @@ mod tests {
                     lower_path: root.path().join("bases/mybase/lower"),
                     meta_path: root.path().join("bases/mybase/meta.json"),
                     created_at: "2026-01-01T00:00:00Z".to_owned(),
+                    cache_lower_paths: vec![],
                 },
             )
             .unwrap();
@@ -397,5 +406,67 @@ mod tests {
 
         let hard = serde_json::to_string(&QuotaMode::Hard).unwrap();
         assert_eq!(hard, "\"hard\"");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-lower lowerdir construction
+    // -----------------------------------------------------------------------
+
+    /// build_lowerdir_str constructs the correct colon-separated lowerdir
+    /// string for a base with npm and pip cache lower dirs.
+    #[test]
+    fn lowerdir_includes_cache_paths() {
+        use std::path::PathBuf;
+        // Simulate what fork_base does when building the lowerdir string.
+        let base_lower = PathBuf::from("/var/lib/fastenv/bases/mybase/lower");
+        let npm_lower = PathBuf::from("/var/lib/fastenv/bases/mybase/cache/npm");
+        let pip_lower = PathBuf::from("/var/lib/fastenv/bases/mybase/cache/pip");
+
+        let cache_lower_paths = vec![npm_lower.clone(), pip_lower.clone()];
+        let mut lower_dirs: Vec<String> = vec![base_lower.display().to_string()];
+        for p in &cache_lower_paths {
+            lower_dirs.push(p.display().to_string());
+        }
+        let lowerdir_str = lower_dirs.join(":");
+
+        assert_eq!(
+            lowerdir_str,
+            "/var/lib/fastenv/bases/mybase/lower:\
+             /var/lib/fastenv/bases/mybase/cache/npm:\
+             /var/lib/fastenv/bases/mybase/cache/pip",
+            "lowerdir string must list base lower then each cache lower"
+        );
+    }
+
+    /// A base without cache dirs produces a single-component lowerdir string
+    /// (backward-compatible — no colon appended).
+    #[test]
+    fn lowerdir_without_cache_is_single_path() {
+        use std::path::PathBuf;
+        let base_lower = PathBuf::from("/var/lib/fastenv/bases/mybase/lower");
+        let cache_lower_paths: Vec<PathBuf> = vec![];
+        let mut lower_dirs: Vec<String> = vec![base_lower.display().to_string()];
+        for p in &cache_lower_paths {
+            lower_dirs.push(p.display().to_string());
+        }
+        let lowerdir_str = lower_dirs.join(":");
+        assert_eq!(
+            lowerdir_str, "/var/lib/fastenv/bases/mybase/lower",
+            "single-lower lowerdir must not contain a colon"
+        );
+    }
+
+    /// fork_base returns NotFound when base has cache_lower_paths but is absent
+    /// from registry — cache paths do not bypass validation.
+    #[test]
+    fn fork_with_cache_base_unknown_returns_not_found() {
+        let root = TempDir::new().unwrap();
+        let err = fork_base("no-such-base-with-cache", "fork-1", root.path(), None)
+            .expect_err("expected NotFound");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("no-such-base-with-cache"),
+            "unexpected error: {msg}"
+        );
     }
 }

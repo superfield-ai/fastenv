@@ -61,6 +61,11 @@ pub struct BaseEntry {
     pub meta_path: PathBuf,
     /// RFC 3339 creation timestamp.
     pub created_at: String,
+    /// Absolute paths to additional read-only cache lower dirs (e.g. cache/npm,
+    /// cache/pip, cache/cargo).  These are appended to `lowerdir=` as extra
+    /// colon-separated entries when the base is forked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_lower_paths: Vec<PathBuf>,
 }
 
 /// Quota enforcement mode for a fork.
@@ -322,6 +327,7 @@ mod tests {
             lower_path: PathBuf::from(format!("/var/lib/fastenv/bases/{}/lower", key)),
             meta_path: PathBuf::from(format!("/var/lib/fastenv/bases/{}/meta.json", key)),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            cache_lower_paths: vec![],
         }
     }
 

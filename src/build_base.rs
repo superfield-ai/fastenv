@@ -13,8 +13,12 @@
 //  4. Tar is extracted into `bases/<key>/lower/`.
 //  5. `bases/<key>/meta.json` is written with layer_digest, source_path, and
 //     created_at.
-//  6. `registry.insert_base` registers the base in registry.json.
-//  7. Idempotent: if the base key already exists in the registry, the command
+//  6. Cache subdirs (`cache/npm`, `cache/pip`, `cache/cargo`) in the source are
+//     detected and each extracted into `bases/<key>/cache/<name>/` as separate
+//     read-only lower dirs; their paths are stored in the registry entry as
+//     `cache_lower_paths`.
+//  7. `registry.insert_base` registers the base in registry.json.
+//  8. Idempotent: if the base key already exists in the registry, the command
 //     returns Ok(()) immediately without re-extracting.
 
 use std::fs;
@@ -42,7 +46,14 @@ pub struct BaseMeta {
     pub source_path: String,
     /// RFC 3339 creation timestamp (UTC, second precision).
     pub created_at: String,
+    /// Names of detected cache subdirectories (e.g. `["npm", "pip"]`).
+    /// Each is extracted as a separate lower dir under `bases/<key>/cache/<name>/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_names: Vec<String>,
 }
+
+/// Known cache subdirectory names detected inside `cache/` of the source dir.
+const KNOWN_CACHE_NAMES: &[&str] = &["npm", "pip", "cargo"];
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -103,32 +114,80 @@ pub fn build_base(source_dir: &Path, base_key: &str, root: &Path) -> Result<()> 
 
     // ── 5. Write bases/<key>/meta.json ───────────────────────────────────────
     let created_at = rfc3339_now();
+
+    // ── 6. Detect and extract cache subdirs ──────────────────────────────────
+    // Scan for cache/<name>/ subdirs in source_dir where <name> is one of
+    // KNOWN_CACHE_NAMES.  Each found cache subdir is extracted into
+    // bases/<key>/cache/<name>/ and its path is appended to cache_lower_paths.
+    let mut cache_lower_paths: Vec<PathBuf> = Vec::new();
+    let mut cache_names: Vec<String> = Vec::new();
+    let cache_source_root = source_dir.join("cache");
+    for &name in KNOWN_CACHE_NAMES {
+        let cache_source_dir = cache_source_root.join(name);
+        if cache_source_dir.is_dir() {
+            let cache_lower_dir = root.join("bases").join(base_key).join("cache").join(name);
+            fs::create_dir_all(&cache_lower_dir).with_context(|| {
+                format!(
+                    "cannot create cache lower dir: {}",
+                    cache_lower_dir.display()
+                )
+            })?;
+            let cache_blob = build_gzip_tar(&cache_source_dir).with_context(|| {
+                format!(
+                    "failed to build tar from cache/{} at {}",
+                    name,
+                    cache_source_dir.display()
+                )
+            })?;
+            let mut archive =
+                tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(&cache_blob)));
+            archive.unpack(&cache_lower_dir).with_context(|| {
+                format!(
+                    "cannot unpack cache/{} tar into {}",
+                    name,
+                    cache_lower_dir.display()
+                )
+            })?;
+            cache_lower_paths.push(cache_lower_dir);
+            cache_names.push(name.to_owned());
+            tracing::info!(
+                command = "build-base",
+                base_key = base_key,
+                cache = name,
+                "cache subdir detected and extracted"
+            );
+        }
+    }
+
     let meta = BaseMeta {
         layer_digest: layer_digest.clone(),
         source_path: source_dir.to_string_lossy().into_owned(),
         created_at: created_at.clone(),
+        cache_names: cache_names.clone(),
     };
     let meta_path = root.join("bases").join(base_key).join("meta.json");
     let meta_bytes = serde_json::to_vec_pretty(&meta)?;
     write_atomic(&meta_path, &meta_bytes)
         .with_context(|| format!("cannot write meta.json to {}", meta_path.display()))?;
 
-    // ── 6. Register base ─────────────────────────────────────────────────────
+    // ── 7. Register base ─────────────────────────────────────────────────────
     registry.insert_base(
         base_key,
         BaseEntry {
             lower_path: lower_dir.clone(),
             meta_path: meta_path.clone(),
             created_at,
+            cache_lower_paths: cache_lower_paths.clone(),
         },
     )?;
 
-    // ── 7. Structured JSON log ───────────────────────────────────────────────
+    // ── 8. Structured JSON log ───────────────────────────────────────────────
     let elapsed_ms = started_at.elapsed().as_millis();
     tracing::info!(
         command      = "build-base",
         base_key     = base_key,
         layer_digest = %layer_digest,
+        cache_count  = cache_lower_paths.len(),
         elapsed_ms   = elapsed_ms,
         "build-base complete"
     );
@@ -373,5 +432,132 @@ mod tests {
             bases.contains_key("mybase"),
             "registry does not contain 'mybase' after build_base"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache subdir detection
+    // -----------------------------------------------------------------------
+
+    fn make_source_tree_with_npm_cache(dir: &Path) {
+        // Regular files
+        fs::write(dir.join("a.txt"), b"hello from a").unwrap();
+        // cache/npm subdir with a package file
+        let npm = dir.join("cache").join("npm");
+        fs::create_dir_all(&npm).unwrap();
+        fs::write(npm.join("lodash-4.17.21.tgz"), b"fake npm package").unwrap();
+    }
+
+    /// build-base on a dir with cache/npm registers a cache entry in the
+    /// registry and creates bases/<key>/cache/npm/ on disk.
+    #[test]
+    fn build_base_detects_npm_cache_dir() {
+        let src = TempDir::new().unwrap();
+        make_source_tree_with_npm_cache(src.path());
+
+        let root = TempDir::new().unwrap();
+        build_base(src.path(), "mybase", root.path()).expect("build_base failed");
+
+        // Registry entry must have one cache_lower_path ending in /cache/npm.
+        let registry = Registry::open(root.path()).unwrap();
+        let entry = registry.get_base("mybase").unwrap();
+        assert_eq!(
+            entry.cache_lower_paths.len(),
+            1,
+            "expected exactly one cache lower path"
+        );
+        assert!(
+            entry.cache_lower_paths[0]
+                .to_string_lossy()
+                .ends_with("cache/npm"),
+            "cache lower path should end with cache/npm, got: {}",
+            entry.cache_lower_paths[0].display()
+        );
+
+        // The extracted cache lower dir must contain the npm package file.
+        let cache_lower = root
+            .path()
+            .join("bases")
+            .join("mybase")
+            .join("cache")
+            .join("npm");
+        assert!(
+            cache_lower.join("lodash-4.17.21.tgz").exists(),
+            "npm cache file missing from cache lower dir"
+        );
+    }
+
+    /// meta.json must record cache_names when cache subdirs are detected.
+    #[test]
+    fn meta_json_records_cache_names() {
+        let src = TempDir::new().unwrap();
+        make_source_tree_with_npm_cache(src.path());
+
+        let root = TempDir::new().unwrap();
+        build_base(src.path(), "mybase", root.path()).expect("build_base failed");
+
+        let meta_path = root.path().join("bases").join("mybase").join("meta.json");
+        let meta: BaseMeta = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta.cache_names, vec!["npm"], "cache_names mismatch");
+    }
+
+    /// build-base without cache dirs must have empty cache_lower_paths in
+    /// the registry — existing bases are unaffected by the new feature.
+    #[test]
+    fn build_base_without_cache_dirs_has_empty_cache_lower_paths() {
+        let src = TempDir::new().unwrap();
+        make_source_tree(src.path()); // no cache/ subdir
+
+        let root = TempDir::new().unwrap();
+        build_base(src.path(), "mybase", root.path()).expect("build_base failed");
+
+        let registry = Registry::open(root.path()).unwrap();
+        let entry = registry.get_base("mybase").unwrap();
+        assert!(
+            entry.cache_lower_paths.is_empty(),
+            "cache_lower_paths should be empty when no cache dirs are present"
+        );
+    }
+
+    /// build-base with all three cache types (npm, pip, cargo) registers all
+    /// three in order.
+    #[test]
+    fn build_base_detects_all_three_cache_dirs() {
+        let src = TempDir::new().unwrap();
+        make_source_tree(src.path());
+        for name in &["npm", "pip", "cargo"] {
+            let cache_dir = src.path().join("cache").join(name);
+            fs::create_dir_all(&cache_dir).unwrap();
+            fs::write(
+                cache_dir.join(format!("{}-pkg.txt", name)),
+                format!("fake {} package", name).as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let root = TempDir::new().unwrap();
+        build_base(src.path(), "mybase", root.path()).expect("build_base failed");
+
+        let registry = Registry::open(root.path()).unwrap();
+        let entry = registry.get_base("mybase").unwrap();
+        assert_eq!(
+            entry.cache_lower_paths.len(),
+            3,
+            "expected 3 cache lower paths"
+        );
+
+        // Verify each cache dir was extracted.
+        for name in &["npm", "pip", "cargo"] {
+            let cache_lower = root
+                .path()
+                .join("bases")
+                .join("mybase")
+                .join("cache")
+                .join(name);
+            assert!(
+                cache_lower.join(format!("{}-pkg.txt", name)).exists(),
+                "{} cache file missing from cache lower dir",
+                name
+            );
+        }
     }
 }
