@@ -4,30 +4,35 @@
 //   - docs/prd.md
 //   - docs/architecture.md
 //   - docs/implementation-plan.md
-//
-// This binary provides the Rust CLI skeleton. All subcommand handlers are stubs
-// that emit a structured JSON log line and exit 0. Business logic is added in
-// subsequent implementation issues.
 
+pub mod build_base;
 pub mod registry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// OCI-native copy-on-write workspace forking for AI agent orchestration.
 #[derive(Parser)]
 #[command(name = "fastenv", version, about, long_about = None)]
 struct Cli {
+    /// fastenv data root directory (default: /var/lib/fastenv).
+    #[arg(long, global = true, default_value = "/var/lib/fastenv")]
+    root: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build and register a base OCI snapshot from an image reference.
+    /// Build and register a base snapshot from a local directory.
     BuildBase {
-        /// Image reference (e.g. docker.io/library/ubuntu:22.04)
-        image: String,
+        /// Path to the source directory to package as a base.
+        dir: PathBuf,
+        /// Registry key for the new base (e.g. "ubuntu-22").
+        #[arg(long)]
+        name: String,
     },
     /// Fork a new writable workspace from the named base snapshot.
     Fork {
@@ -100,8 +105,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::BuildBase { image } => {
-            tracing::info!(command = "build-base", image = %image, "not yet implemented");
+        Commands::BuildBase { dir, name } => {
+            build_base::build_base(&dir, &name, &cli.root)?;
         }
         Commands::Fork { base, fork_id } => {
             tracing::info!(command = "fork", base = %base, fork_id = %fork_id, "not yet implemented");
