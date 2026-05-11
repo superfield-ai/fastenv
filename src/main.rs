@@ -12,6 +12,7 @@ pub mod du;
 pub mod exec;
 pub mod export_patch;
 pub mod fork;
+pub mod quota;
 pub mod registry;
 
 use anyhow::Result;
@@ -48,6 +49,12 @@ enum Commands {
         /// Unique identifier for the new fork.
         #[arg(long)]
         name: String,
+        /// Maximum writable disk quota for this fork's upper layer.
+        /// Accepts human-readable sizes: 512B, 10KiB, 1MiB, 2GiB, etc.
+        /// On prjquota filesystems, hard quota is enforced by the kernel.
+        /// On other filesystems, quota is tracked in soft mode (warn-only via `du`).
+        #[arg(long)]
+        quota: Option<String>,
     },
     /// Discard a fork and release its snapshot resources.
     Discard {
@@ -129,8 +136,9 @@ fn main() -> Result<()> {
         Commands::BuildBase { dir, name } => {
             build_base::build_base(&dir, &name, &cli.root)?;
         }
-        Commands::Fork { base, name } => {
-            fork::fork_base(&base, &name, &cli.root)?;
+        Commands::Fork { base, name, quota } => {
+            let quota_bytes = quota.as_deref().map(quota::parse_quota_size).transpose()?;
+            fork::fork_base(&base, &name, &cli.root, quota_bytes)?;
         }
         Commands::Discard { fork_id } => {
             discard::discard_fork(&fork_id, &cli.root)?;
