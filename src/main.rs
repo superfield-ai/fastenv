@@ -6,6 +6,7 @@
 //   - docs/implementation-plan.md
 
 pub mod build_base;
+pub mod fork;
 pub mod registry;
 
 use anyhow::Result;
@@ -36,10 +37,12 @@ enum Commands {
     },
     /// Fork a new writable workspace from the named base snapshot.
     Fork {
-        /// Name of the base snapshot to fork from
+        /// Name of the base snapshot to fork from.
+        #[arg(long)]
         base: String,
-        /// Unique identifier for the new fork
-        fork_id: String,
+        /// Unique identifier for the new fork.
+        #[arg(long)]
+        name: String,
     },
     /// Discard a fork and release its snapshot resources.
     Discard {
@@ -108,8 +111,8 @@ fn main() -> Result<()> {
         Commands::BuildBase { dir, name } => {
             build_base::build_base(&dir, &name, &cli.root)?;
         }
-        Commands::Fork { base, fork_id } => {
-            tracing::info!(command = "fork", base = %base, fork_id = %fork_id, "not yet implemented");
+        Commands::Fork { base, name } => {
+            fork::fork_base(&base, &name, &cli.root)?;
         }
         Commands::Discard { fork_id } => {
             tracing::info!(command = "discard", fork_id = %fork_id, "not yet implemented");
