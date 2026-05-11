@@ -22,8 +22,8 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::fork::fork_base;
 use crate::discard::discard_fork;
+use crate::fork::fork_base;
 use crate::registry::Registry;
 
 // ---------------------------------------------------------------------------
@@ -92,11 +92,7 @@ pub fn run_bench(base_key: &str, root: &Path, opts: &BenchOptions) -> Result<Ben
     for i in 0..opts.iterations {
         // Progress line to stderr every 10 iterations.
         if i % 10 == 0 {
-            eprint!(
-                "bench: fork iteration {}/{}\r",
-                i + 1,
-                opts.iterations
-            );
+            eprint!("bench: fork iteration {}/{}\r", i + 1, opts.iterations);
             let _ = std::io::stderr().flush();
         }
 
@@ -111,12 +107,18 @@ pub fn run_bench(base_key: &str, root: &Path, opts: &BenchOptions) -> Result<Ben
 
         // Discard immediately; accumulate any error after the loop.
         discard_fork(&fork_id, root).with_context(|| {
-            format!("bench: cleanup fork '{}' after fork latency measurement", fork_id)
+            format!(
+                "bench: cleanup fork '{}' after fork latency measurement",
+                fork_id
+            )
         })?;
     }
 
     // Clear the progress line.
-    eprintln!("bench: fork iterations complete ({} samples)        ", opts.iterations);
+    eprintln!(
+        "bench: fork iterations complete ({} samples)        ",
+        opts.iterations
+    );
 
     // ── 3. Exec latency iterations (optional) ─────────────────────────────────
     let exec_stats: Option<(f64, f64, f64)> = if opts.measure_exec {
@@ -124,11 +126,7 @@ pub fn run_bench(base_key: &str, root: &Path, opts: &BenchOptions) -> Result<Ben
 
         for i in 0..opts.iterations {
             if i % 10 == 0 {
-                eprint!(
-                    "bench: exec iteration {}/{}\r",
-                    i + 1,
-                    opts.iterations
-                );
+                eprint!("bench: exec iteration {}/{}\r", i + 1, opts.iterations);
                 let _ = std::io::stderr().flush();
             }
 
@@ -296,7 +294,9 @@ mod tests {
         assert!((m["fork_p95_ms"].as_f64().unwrap() - 45.6).abs() < 1e-9);
         assert!((m["fork_p99_ms"].as_f64().unwrap() - 78.9).abs() < 1e-9);
         // exec fields must be absent when None
-        assert!(m.get("exec_p50_ms").map_or(true, |v| v.is_null() || v == &serde_json::Value::Null));
+        assert!(m
+            .get("exec_p50_ms")
+            .map_or(true, |v| v.is_null() || v == &serde_json::Value::Null));
         assert!(m["meets_budget_p95"].as_bool().unwrap());
     }
 

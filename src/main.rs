@@ -225,8 +225,7 @@ fn main() -> Result<()> {
                     measure_exec: exec,
                 },
             )?;
-            let json = serde_json::to_string_pretty(&result)
-                .context("serialize bench result")?;
+            let json = serde_json::to_string_pretty(&result).context("serialize bench result")?;
             println!("{json}");
         }
     }
