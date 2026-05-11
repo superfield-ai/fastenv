@@ -8,6 +8,7 @@
 pub mod build_base;
 pub mod diff;
 pub mod discard;
+pub mod du;
 pub mod exec;
 pub mod fork;
 pub mod registry;
@@ -154,7 +155,7 @@ fn main() -> Result<()> {
             diff::diff_fork(&fork_id, &cli.root)?;
         }
         Commands::Du { fork_id } => {
-            tracing::info!(command = "du", fork_id = %fork_id, "not yet implemented");
+            du::du_fork(&fork_id, &cli.root)?;
         }
         Commands::ExportPatch { fork_id, output } => {
             tracing::info!(command = "export-patch", fork_id = %fork_id, output = %output, "not yet implemented");
