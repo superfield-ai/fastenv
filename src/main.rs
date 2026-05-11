@@ -5,6 +5,7 @@
 //   - docs/architecture.md
 //   - docs/implementation-plan.md
 
+pub mod bench;
 pub mod build_base;
 pub mod diff;
 pub mod discard;
@@ -128,9 +129,15 @@ enum Commands {
     },
     /// Run a performance benchmark against core fastenv operations.
     Bench {
-        /// Number of iterations
-        #[arg(long, default_value = "10")]
+        /// Base snapshot name to fork from (required).
+        #[arg(long)]
+        base: String,
+        /// Number of fork+discard iterations to run.
+        #[arg(long, default_value = "100")]
         iterations: u32,
+        /// Also measure exec start latency (runs exec /bin/true for each iteration).
+        #[arg(long)]
+        exec: bool,
     },
 }
 
@@ -205,8 +212,22 @@ fn main() -> Result<()> {
         Commands::Unmount { fork_id } => {
             mount_path::unmount_fork(&fork_id, &cli.root)?;
         }
-        Commands::Bench { iterations } => {
-            tracing::info!(command = "bench", iterations, "not yet implemented");
+        Commands::Bench {
+            base,
+            iterations,
+            exec,
+        } => {
+            let result = bench::run_bench(
+                &base,
+                &cli.root,
+                &bench::BenchOptions {
+                    iterations,
+                    measure_exec: exec,
+                },
+            )?;
+            let json = serde_json::to_string_pretty(&result)
+                .context("serialize bench result")?;
+            println!("{json}");
         }
     }
 
