@@ -60,7 +60,8 @@ jobs:
 
   rust-fmt:
     name: Rust fmt
-    runs-on: [self-hosted, Linux, X64]
+    # fmt only needs rustfmt; no system deps (crun, overlayfs) required.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -74,7 +75,7 @@ jobs:
 
   rust-lint:
     name: Rust clippy
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -91,7 +92,7 @@ jobs:
 
   rust-test:
     name: Rust test
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
