@@ -10,6 +10,7 @@ pub mod diff;
 pub mod discard;
 pub mod du;
 pub mod exec;
+pub mod export_patch;
 pub mod fork;
 pub mod registry;
 
@@ -87,8 +88,9 @@ enum Commands {
     ExportPatch {
         /// Fork identifier to export
         fork_id: String,
-        /// Output path for the patch archive
-        output: String,
+        /// Write tar to this file instead of stdout
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Garbage-collect stale or orphaned forks and snapshots.
     Gc,
@@ -158,7 +160,7 @@ fn main() -> Result<()> {
             du::du_fork(&fork_id, &cli.root)?;
         }
         Commands::ExportPatch { fork_id, output } => {
-            tracing::info!(command = "export-patch", fork_id = %fork_id, output = %output, "not yet implemented");
+            export_patch::export_patch(&fork_id, &cli.root, output.as_deref())?;
         }
         Commands::Gc => {
             tracing::info!(command = "gc", "not yet implemented");
