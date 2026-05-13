@@ -66,6 +66,7 @@ struct MountPathOutput<'a> {
 ///
 /// Prints JSON containing `fork_id` and `mount_path` on success.
 /// Idempotent: if merged/ is already mounted, returns existing path without error.
+#[deprecated(note = "Use boundary::GuestRuntime::mount_path instead.")]
 pub fn mount_path(fork_key: &str, root: &Path) -> Result<()> {
     let registry = Registry::open(root)?;
 
@@ -167,6 +168,7 @@ pub fn mount_path(fork_key: &str, root: &Path) -> Result<()> {
 /// * `root`     — fastenv data root (e.g. `/var/lib/fastenv`).
 ///
 /// Exits non-zero if the fork has no active merged mount.
+#[deprecated(note = "Use boundary::GuestRuntime::unmount_fork instead.")]
 pub fn unmount_fork(fork_key: &str, root: &Path) -> Result<()> {
     let registry = Registry::open(root)?;
 
@@ -246,6 +248,7 @@ fn is_mounted(path: &Path) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

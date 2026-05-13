@@ -212,9 +212,21 @@ fn main() -> Result<()> {
             guest.run_gc(&cli.root, &opts)?;
         }
         Commands::MountPath { fork_id } => {
+            tracing::warn!(
+                command = "mount-path",
+                fork_id = %fork_id,
+                boundary = "boundary::GuestRuntime",
+                "deprecated CLI entrypoint; use the explicit host/guest boundary"
+            );
             guest.mount_path(&fork_id, &cli.root)?;
         }
         Commands::Unmount { fork_id } => {
+            tracing::warn!(
+                command = "unmount",
+                fork_id = %fork_id,
+                boundary = "boundary::GuestRuntime",
+                "deprecated CLI entrypoint; use the explicit host/guest boundary"
+            );
             guest.unmount_fork(&fork_id, &cli.root)?;
         }
         Commands::Bench {

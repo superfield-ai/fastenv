@@ -101,10 +101,12 @@ impl GuestRuntime for LocalGuestRuntime {
     }
 
     fn mount_path(&self, fork_key: &str, root: &Path) -> Result<()> {
+        #[allow(deprecated)]
         mount_path::mount_path(fork_key, root)
     }
 
     fn unmount_fork(&self, fork_key: &str, root: &Path) -> Result<()> {
+        #[allow(deprecated)]
         mount_path::unmount_fork(fork_key, root)
     }
 
