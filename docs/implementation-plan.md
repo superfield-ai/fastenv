@@ -64,6 +64,7 @@ guest interfaces before deleting the old implicit ones.
 
 - [ ] Add a host/guest boundary layer in code and docs so the current
       workspace-engine logic can be called as a guest primitive.
+      The explicit seam lives in `src/boundary.rs`.
 - [ ] Add a regression suite that records the current behavior of
       `build-base`, `fork`, `exec`, `diff`, `du`, `export-patch`, `gc`, and
       `bench`.
