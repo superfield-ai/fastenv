@@ -30,7 +30,9 @@ VMs alone are too expensive for per-agent fan-out. fastenv combines both.
 
 - The project boundary is the VM boundary.
 - The agent boundary is the container boundary.
-- eBPF is for observability and policy, not the primary sandbox.
+- eBPF is a dual-layer policy and audit plane: host eBPF protects the
+  Firecracker boundary, and guest eBPF observes and constrains agents inside
+  the VM.
 - The host control plane never executes project code directly.
 - Secrets must be short-lived, scoped, and brokered.
 - Writable sharing across tenants is prohibited.
@@ -68,9 +70,10 @@ The host should not need live access to the guest's internal workspace layout.
 
 ### 4.5 Policy and Observability
 
-Host eBPF must observe the Firecracker/jailer boundary and the VM's host-side
-resources. Guest eBPF may observe agent behavior inside the VM for auditing,
-debugging, and local policy enforcement.
+Host eBPF must run in the host kernel and observe the Firecracker/jailer
+boundary plus the VM's host-side resources. Guest eBPF may run in the guest
+kernel and observe agent behavior inside the VM for auditing, debugging, and
+local policy enforcement.
 
 ### 4.6 Network and Secrets
 
@@ -99,6 +102,7 @@ into base images or mounted from host home directories.
 - Shared writable caches across tenants
 - Mounting host credentials or `~/.ssh` into agent environments
 - Using eBPF as the primary isolation boundary
+- Collapsing host and guest eBPF into a single policy layer
 - One giant VM shared by all projects
 
 ## 7. Success Criteria
@@ -111,3 +115,5 @@ into base images or mounted from host home directories.
   system exposure.
 - The architecture stays explicit about which layer owns each security
   boundary.
+- Host and guest eBPF policy remain separate and kernel-local to their
+  respective layers.
