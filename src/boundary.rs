@@ -18,7 +18,9 @@ use crate::{
     bench::{self, BenchOptions, BenchResult},
     build_base, diff, discard, du,
     exec::{self, ExecOptions},
-    export_patch, fork, gc, mount_path,
+    export_patch, fork, gc,
+    host_control_plane::ProjectVmSupervisor,
+    mount_path,
 };
 
 /// Guest-runtime boundary for the current workspace engine.
@@ -122,14 +124,17 @@ impl GuestRuntime for LocalGuestRuntime {
 /// primitive explicitly.
 pub trait HostControlPlane {
     type Guest: GuestRuntime;
+    type Supervisor;
 
     fn guest(&self) -> &Self::Guest;
+    fn supervisor(&self) -> &Self::Supervisor;
 }
 
 /// Default host-control-plane wrapper around the current runtime.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalHostControlPlane {
     guest: LocalGuestRuntime,
+    supervisor: ProjectVmSupervisor,
 }
 
 impl LocalHostControlPlane {
@@ -140,9 +145,14 @@ impl LocalHostControlPlane {
 
 impl HostControlPlane for LocalHostControlPlane {
     type Guest = LocalGuestRuntime;
+    type Supervisor = ProjectVmSupervisor;
 
     fn guest(&self) -> &Self::Guest {
         &self.guest
+    }
+
+    fn supervisor(&self) -> &Self::Supervisor {
+        &self.supervisor
     }
 }
 
@@ -153,6 +163,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    use crate::host_control_plane::{
+        ArtifactRecord, HostEbpfPolicy, NetworkPolicy, ProjectVmSpec, SecretLease, VmState,
+    };
     use crate::registry::{ForkEntry, QuotaMode, Registry};
 
     fn make_fork_entry(
@@ -262,5 +275,115 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn host_control_plane_provisions_and_tracks_vm_state() {
+        let host = LocalHostControlPlane::new();
+        let root = TempDir::new().unwrap();
+
+        let record = host
+            .supervisor()
+            .provision_project_vm(
+                root.path(),
+                &ProjectVmSpec {
+                    project_id: "project-1".to_owned(),
+                    kernel_ref: Some("kernel-6.1".to_owned()),
+                    seed_data_refs: vec!["seed-ro".to_owned()],
+                    network_policy: NetworkPolicy::Allowlist {
+                        hosts: vec!["mirror.local".to_owned()],
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(record.project_id, "project-1");
+        assert_eq!(record.state, VmState::Provisioned);
+        assert!(record.vm_dir.ends_with("vms/project-1"));
+        assert!(record.state_path.exists());
+        assert!(record.logs_dir.is_dir());
+        assert!(record.artifacts_dir.is_dir());
+        assert!(record.kernel_path.exists());
+        assert!(record.rootfs_path.exists());
+        assert!(record.workspace_path.exists());
+
+        let record = host
+            .supervisor()
+            .transition_vm_state(root.path(), "project-1", VmState::Running)
+            .unwrap();
+        assert_eq!(record.state, VmState::Running);
+
+        let record = host
+            .supervisor()
+            .transition_vm_state(root.path(), "project-1", VmState::Stopped)
+            .unwrap();
+        assert_eq!(record.state, VmState::Stopped);
+
+        let record = host
+            .supervisor()
+            .attach_network_policy(
+                root.path(),
+                "project-1",
+                NetworkPolicy::PackageMirrorOnly {
+                    mirror: Some("https://mirror.local".to_owned()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            record.network_policy,
+            NetworkPolicy::PackageMirrorOnly { .. }
+        ));
+
+        let record = host
+            .supervisor()
+            .inject_secret(
+                root.path(),
+                "project-1",
+                SecretLease {
+                    secret_name: "npm-token".to_owned(),
+                    scope: "project".to_owned(),
+                    expires_at: "2026-01-01T00:00:00Z".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.secrets.len(), 1);
+
+        let record = host
+            .supervisor()
+            .collect_artifact(
+                root.path(),
+                "project-1",
+                ArtifactRecord {
+                    name: "patch.tar".to_owned(),
+                    kind: "patch".to_owned(),
+                    path: root.path().join("vms/project-1/artifacts/patch.tar"),
+                    digest: Some("sha256:abc".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.artifacts.len(), 1);
+
+        let record = host
+            .supervisor()
+            .load_host_ebpf_policy(
+                root.path(),
+                "project-1",
+                HostEbpfPolicy {
+                    name: "firecracker-boundary".to_owned(),
+                    attach_point: "firecracker/jailer".to_owned(),
+                    object_path: root.path().join("policy.o"),
+                },
+            )
+            .unwrap();
+        assert!(record.host_ebpf_policy.is_some());
+
+        let stored = host
+            .supervisor()
+            .get_project_vm(root.path(), "project-1")
+            .unwrap();
+        assert_eq!(stored.state, VmState::Stopped);
+        assert_eq!(stored.secrets.len(), 1);
+        assert_eq!(stored.artifacts.len(), 1);
+        assert!(stored.host_ebpf_policy.is_some());
     }
 }

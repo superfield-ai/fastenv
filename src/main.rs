@@ -15,6 +15,7 @@ pub mod exec;
 pub mod export_patch;
 pub mod fork;
 pub mod gc;
+pub mod host_control_plane;
 pub mod mount_path;
 pub mod quota;
 pub mod registry;
