@@ -1,0 +1,113 @@
+# fastenv Product Requirements
+
+## 1. Product Vision
+
+fastenv is a workspace platform for AI coding agents. Its primary job is to
+give each project a durable Firecracker microVM boundary, while keeping the
+agent/task boundary cheap by running `crun` containers inside that VM.
+
+The intent is to separate trust domains cleanly:
+
+- Host and control plane manage scheduling, secrets, policy, and artifact flow.
+- Project VM contains one repo, tenant, or other security domain.
+- Agent containers inside the VM isolate individual runs, branches, or tasks.
+
+## 2. Problem Statement
+
+AI agents need to run many commands in parallel:
+
+- dependency installers
+- build and test pipelines
+- generated scripts
+- shell commands from prompts
+
+Those commands are often semi-untrusted from the host's point of view. A
+plain container boundary is not strong enough when the goal is to protect the
+host and neighboring projects from compromise. A VM boundary is stronger, but
+VMs alone are too expensive for per-agent fan-out. fastenv combines both.
+
+## 3. Product Principles
+
+- The project boundary is the VM boundary.
+- The agent boundary is the container boundary.
+- eBPF is for observability and policy, not the primary sandbox.
+- The host control plane never executes project code directly.
+- Secrets must be short-lived, scoped, and brokered.
+- Writable sharing across tenants is prohibited.
+
+## 4. Functional Requirements
+
+### 4.1 Project Isolation
+
+Each project gets one Firecracker microVM as its durable isolation boundary.
+The project boundary should be chosen at the smallest trust domain that the
+operator is willing to let share a guest kernel and project-local caches.
+
+### 4.2 Agent Isolation
+
+Inside each project VM, fastenv must be able to launch multiple `crun`
+containers. Each container represents an agent run, branch, test job, or
+similar unit of work.
+
+### 4.3 Workspace Isolation
+
+Each agent container must have its own workspace, temp area, and process tree.
+Writes from one agent must not corrupt another agent's workspace or runtime
+state.
+
+### 4.4 Controlled Output Flow
+
+Project work must leave the VM only through validated outputs such as:
+
+- patches
+- logs
+- test artifacts
+- build artifacts
+
+The host should not need live access to the guest's internal workspace layout.
+
+### 4.5 Policy and Observability
+
+Host eBPF must observe the Firecracker/jailer boundary and the VM's host-side
+resources. Guest eBPF may observe agent behavior inside the VM for auditing,
+debugging, and local policy enforcement.
+
+### 4.6 Network and Secrets
+
+Network policy must be hierarchical:
+
+- host decides whether a VM gets network access at all
+- project VM decides project-level access policy
+- agent container may further restrict access for a particular run
+
+Secrets must be injected only when needed, must expire, and must not be baked
+into base images or mounted from host home directories.
+
+## 5. Performance Expectations
+
+- Agent sandbox creation inside a live project VM should remain fast enough
+  for interactive agent loops.
+- Project VM provisioning may be slower than container startup and may be
+  handled by prewarming or reuse within the same trust domain.
+- The system should preserve cheap fan-out for multiple concurrent agents once
+  the project VM exists.
+
+## 6. Non-Goals
+
+- Running project code directly on the host
+- Treating host containers as the security boundary for untrusted projects
+- Shared writable caches across tenants
+- Mounting host credentials or `~/.ssh` into agent environments
+- Using eBPF as the primary isolation boundary
+- One giant VM shared by all projects
+
+## 7. Success Criteria
+
+- A compromised project must not be able to compromise the host or another
+  tenant through the supported execution path.
+- Multiple agents can run concurrently inside the same project VM without
+  stomping on each other's workspaces.
+- The host can recover patches and artifacts without trusting live guest file
+  system exposure.
+- The architecture stays explicit about which layer owns each security
+  boundary.
