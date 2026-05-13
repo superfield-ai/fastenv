@@ -22,8 +22,10 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+use std::{collections::BTreeMap, fmt};
 
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::registry::{Registry, RegistryError};
@@ -41,8 +43,8 @@ pub struct ExecOptions {
     pub cpu: Option<CpuSpec>,
     /// Memory limit in bytes.
     pub memory: Option<u64>,
-    /// Network mode: None = inherit, Some("none") = isolated, Some("host") = host.
-    pub network: Option<String>,
+    /// Guest network policy to apply inside the VM.
+    pub network: GuestNetworkMode,
 }
 
 /// CPU resource specification.
@@ -54,13 +56,54 @@ pub enum CpuSpec {
     Cpuset(String),
 }
 
+/// Guest-network policy modes that can be applied inside the project VM.
+///
+/// `Host` is retained as the compatibility default for the current direct
+/// subprocess launcher, while the other modes are the guest-runtime surface
+/// called out in the refactor plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestNetworkMode {
+    /// Compatibility mode: share the caller's network namespace.
+    #[default]
+    Host,
+    /// Isolate the container in a private network namespace without egress.
+    None,
+    /// Private network namespace plus guest-managed package mirror access.
+    PackageMirrorOnly,
+    /// Private network namespace plus an allowlist of destinations.
+    Allowlist,
+    /// Private network namespace with audit logging on egress.
+    AuditedEgress,
+}
+
+impl GuestNetworkMode {
+    /// Returns true when the mode needs a private network namespace.
+    fn requires_netns(self) -> bool {
+        !matches!(self, GuestNetworkMode::Host)
+    }
+}
+
+impl fmt::Display for GuestNetworkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            GuestNetworkMode::Host => "host",
+            GuestNetworkMode::None => "none",
+            GuestNetworkMode::PackageMirrorOnly => "package-mirror-only",
+            GuestNetworkMode::Allowlist => "allowlist",
+            GuestNetworkMode::AuditedEgress => "audited-egress",
+        };
+        f.write_str(label)
+    }
+}
+
 impl Default for ExecOptions {
     fn default() -> Self {
         ExecOptions {
             crun_path: "/usr/bin/crun".to_owned(),
             cpu: None,
             memory: None,
-            network: None,
+            network: GuestNetworkMode::Host,
         }
     }
 }
@@ -164,7 +207,7 @@ pub fn run_exec(fork_id: &str, command: &[String], root: &Path, opts: &ExecOptio
     let duration_ms = started_at.elapsed().as_millis();
 
     // ── 6. Structured JSON log ───────────────────────────────────────────────
-    let network_mode = opts.network.as_deref().unwrap_or("default").to_owned();
+    let network_mode = opts.network.to_string();
     tracing::info!(
         command = "exec",
         fork_id = fork_id,
@@ -196,6 +239,8 @@ struct OciConfig {
     root: OciRoot,
     mounts: Vec<OciMount>,
     linux: OciLinux,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,21 +338,46 @@ fn build_oci_config(
         },
     ];
 
-    // Network namespace: default = inherit (no entry), "none" = isolated, "host" = host path
-    match opts.network.as_deref() {
-        None | Some("host") => {
-            // host: no network namespace entry → shares host network
-        }
-        Some("none") => {
-            namespaces.push(OciNamespace {
-                ns_type: "network".to_owned(),
-                path: None,
-            });
-        }
-        Some(other) => {
-            // Unknown value — treat as host
-            tracing::warn!(network = other, "unknown --network value; treating as host");
-        }
+    let mut annotations = BTreeMap::new();
+    annotations.insert(
+        "fastenv.guest.network-mode".to_owned(),
+        opts.network.to_string(),
+    );
+    annotations.insert("fastenv.guest.policy-plane".to_owned(), "guest".to_owned());
+
+    // Guest network modes always get a private namespace. Host compatibility
+    // keeps the legacy no-netns path available for the current launcher.
+    if opts.network.requires_netns() {
+        namespaces.push(OciNamespace {
+            ns_type: "network".to_owned(),
+            path: None,
+        });
+    }
+
+    if matches!(opts.network, GuestNetworkMode::None) {
+        // No extra host networking setup is needed for the isolated mode.
+    } else if matches!(opts.network, GuestNetworkMode::PackageMirrorOnly) {
+        annotations.insert(
+            "fastenv.guest.network.purpose".to_owned(),
+            "package-mirror".to_owned(),
+        );
+    } else if matches!(opts.network, GuestNetworkMode::Allowlist) {
+        annotations.insert(
+            "fastenv.guest.network.purpose".to_owned(),
+            "allowlist".to_owned(),
+        );
+    } else if matches!(opts.network, GuestNetworkMode::AuditedEgress) {
+        annotations.insert(
+            "fastenv.guest.network.purpose".to_owned(),
+            "audited-egress".to_owned(),
+        );
+    }
+
+    if matches!(opts.network, GuestNetworkMode::Host) {
+        annotations.insert(
+            "fastenv.guest.policy-loader".to_owned(),
+            "deferred".to_owned(),
+        );
     }
 
     // ── Resources ─────────────────────────────────────────────────────────────
@@ -380,6 +450,7 @@ fn build_oci_config(
             namespaces,
             resources,
         },
+        annotations: Some(annotations),
     }
 }
 
@@ -457,7 +528,7 @@ mod tests {
         let command = vec!["true".to_owned()];
         let merged = PathBuf::from("/tmp/merged");
         let mut opts = default_opts();
-        opts.network = Some("none".to_owned());
+        opts.network = GuestNetworkMode::None;
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let has_netns = config
             .linux
@@ -473,7 +544,7 @@ mod tests {
         let command = vec!["true".to_owned()];
         let merged = PathBuf::from("/tmp/merged");
         let mut opts = default_opts();
-        opts.network = Some("host".to_owned());
+        opts.network = GuestNetworkMode::Host;
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let has_netns = config
             .linux
@@ -484,6 +555,39 @@ mod tests {
             !has_netns,
             "network namespace should not be present for --network host"
         );
+    }
+
+    /// Guest-scoped network modes add a private network namespace.
+    #[test]
+    fn oci_config_guest_network_modes_add_netns() {
+        let command = vec!["true".to_owned()];
+        let merged = PathBuf::from("/tmp/merged");
+
+        for mode in [
+            GuestNetworkMode::None,
+            GuestNetworkMode::PackageMirrorOnly,
+            GuestNetworkMode::Allowlist,
+            GuestNetworkMode::AuditedEgress,
+        ] {
+            let mut opts = default_opts();
+            opts.network = mode;
+            let config = build_oci_config("agent-1", &command, &merged, &opts);
+            let expected_mode = mode.to_string();
+            let has_netns = config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network");
+            assert!(has_netns, "network namespace missing for {mode:?}");
+            assert_eq!(
+                config
+                    .annotations
+                    .as_ref()
+                    .and_then(|m| m.get("fastenv.guest.network-mode"))
+                    .map(String::as_str),
+                Some(expected_mode.as_str())
+            );
+        }
     }
 
     /// Memory limit is serialised into resources when --memory is set.
@@ -511,6 +615,23 @@ mod tests {
         let cpu = resources.cpu.expect("cpu should be present");
         assert_eq!(cpu.shares, Some(512));
         assert!(cpu.cpus.is_none());
+    }
+
+    /// Host compatibility mode records the guest policy loader annotation.
+    #[test]
+    fn oci_config_host_records_policy_loader_annotation() {
+        let command = vec!["true".to_owned()];
+        let merged = PathBuf::from("/tmp/merged");
+        let opts = default_opts();
+        let config = build_oci_config("agent-1", &command, &merged, &opts);
+        assert_eq!(
+            config
+                .annotations
+                .as_ref()
+                .and_then(|m| m.get("fastenv.guest.policy-loader"))
+                .map(String::as_str),
+            Some("deferred")
+        );
     }
 
     /// CPU cpuset is serialised into resources when --cpu string is set.

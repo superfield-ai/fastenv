@@ -25,6 +25,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use boundary::{GuestRuntime, HostControlPlane, LocalHostControlPlane};
+use exec::GuestNetworkMode;
 
 /// OCI-native copy-on-write workspace forking for AI agent orchestration.
 #[derive(Parser)]
@@ -84,9 +85,9 @@ enum Commands {
         /// Memory limit in bytes (e.g. 67108864 for 64 MiB)
         #[arg(long)]
         memory: Option<u64>,
-        /// Network mode: 'none' for isolated, 'host' for host networking
-        #[arg(long)]
-        network: Option<String>,
+        /// Guest network mode inside the VM.
+        #[arg(long, value_enum, default_value_t = GuestNetworkMode::Host)]
+        network: GuestNetworkMode,
     },
     /// Show a unified diff of changes made inside a fork.
     Diff {
