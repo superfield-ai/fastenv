@@ -1,167 +1,129 @@
 # fastenv
 
-**OCI-native ultrafast workspace forking for AI agents.**
+**Project-isolated workspace runtime for AI agents.**
 
-fastenv lets AI agents (Codex, Claude, etc.) fork isolated workspaces in **≤100ms p95** using OCI container primitives — no file copies, no git worktrees, no disk exhaustion.
+fastenv gives each project a durable Firecracker microVM boundary and runs
+individual agent tasks inside `crun` containers within that VM. The result is
+strong project isolation with cheap per-agent fan-out.
+
+The canonical product requirements live in [docs/prd.md](docs/prd.md), and the
+target architecture lives in [docs/architecture.md](docs/architecture.md).
 
 ---
 
 ## The problem
 
-AI agents need isolated environments to run in parallel. The naive approach — copying the workspace per agent — is too slow and too expensive at scale. Git worktrees solve disk duplication but not dependency isolation. VMs solve isolation but not latency.
+AI agents need isolated environments to run in parallel. Plain host containers
+give concurrency, but they still share the host kernel directly. fastenv uses a
+microVM per project to raise the trust boundary, then uses containers inside
+the VM to keep per-agent execution cheap.
 
-fastenv solves all three: instant forks, isolated execution, minimal disk overhead.
+fastenv is designed for AI vendor software such as Claude Code, Codex, and
+similar coding agents.
+
+---
+
+## What fastenv isolates
+
+**Isolated per project VM**
+- Project code and dependency scripts
+- Project-local caches
+- Project-local network policy
+- Project-local secrets, if any
+
+**Isolated per agent container inside the VM**
+- Filesystem writes through copy-on-write overlays
+- Process trees and temp directories
+- Per-agent resource limits
+
+**Observed and governed by the host**
+- Firecracker lifecycle and jailer policy
+- Network attachment and egress policy
+- Artifact export and patch validation
+- Host-side eBPF monitoring
+
+fastenv is a security boundary for semi-untrusted project workloads. The host
+is not expected to run project code directly.
 
 ---
 
 ## Design principle
 
-We are not building a custom filesystem.
+fastenv is not trying to turn host containers into the tenant boundary.
 
-> **OCI-native copy-on-write environment branching using container snapshotters**
-
-```
-OCI image (prepared workspace)
-        ↓
-containerd snapshot (base)
-        ↓
-copy-on-write snapshot (fork)
-        ↓
-OCI runtime (exec inside fork)
+```text
+Host / control plane
+  └── Project VM: one Firecracker microVM per repo / tenant / project
+        └── Agent sandboxes: crun containers inside the VM
+              └── Process/tool execution
 ```
 
-Each fork is a **containerd snapshot layer**, not a filesystem copy. The base image is content-addressed and shared across all forks. Only writes are tracked, per fork, in a thin writable layer.
-
----
-
-## Usage
-
-### 1. Build a base workspace image
-
-```bash
-fastenv build-base .
-```
-
-Produces an OCI image containing: repo checkout, installed dependencies, toolchain, optionally pre-populated caches. Immutable and reusable.
-
-### 2. Fork it
-
-```bash
-fastenv fork --base <image> --name <fork-id>
-```
-
-Creates a writable snapshot layer on top of the base. No file copying. Target: p50 ≤ 50ms, p95 ≤ 100ms.
-
-### 3. Execute inside the fork
-
-```bash
-fastenv exec <fork-id> -- <cmd>
-```
-
-Runs with isolated mount namespace, isolated PID namespace, optional network isolation, and configurable CPU/memory limits. Uses crun via containerd for fast startup.
-
-### 4. Inspect changes
-
-```bash
-fastenv diff <fork-id>
-fastenv du <fork-id>          # writable layer size only — not base image
-fastenv export-patch <fork-id>
-```
-
-### 5. Discard
-
-```bash
-fastenv discard <fork-id>
-```
-
-Instant. Snapshot GC removes all traces.
-
----
-
-## Full lifecycle
-
-```bash
-fastenv build-base .
-fastenv fork --base my-workspace --name agent-1
-fastenv exec agent-1 -- pytest
-fastenv diff agent-1
-fastenv discard agent-1
-```
+That hierarchy keeps the project boundary at the VM layer and the agent
+boundary at the container layer. eBPF is used for policy and observability.
 
 ---
 
 ## Architecture
 
-### Snapshotter
+### Host control plane
 
-Uses the containerd snapshot API. Supported snapshotters:
+The host owns:
 
-| Snapshotter | Notes |
-| --- | --- |
-| **overlayfs** | Default. Kernel-native, widely supported |
-| **stargz** | Lazy-loading — files fetched on demand, not on fork |
-| **nydus** | Content-addressed + deduplication |
+- project scheduling
+- Firecracker VM lifecycle
+- jailer and seccomp policy
+- secret brokering
+- artifact validation
+- host-side eBPF monitoring
+- network attachment policy
 
-Lazy snapshotters are preferred where available — fork latency is not gated on materializing the full base image.
+No project code executes directly on the host.
 
-### Shared caches
+### Project VM
 
-Dependencies are never duplicated across forks. Package caches (`/cache/npm`, `/cache/pip`, `/cache/cargo`) are mounted as shared content-addressed layers. Reads are served from the shared mount; writes go through a controlled per-fork cache layer.
+Each project gets one Firecracker microVM for the relevant trust domain. The
+VM contains:
 
-### Disk management
+- a guest kernel
+- project-local filesystem state
+- project-local caches
+- project-local network policy
+- an optional guest eBPF monitor
 
-- **Per-fork quotas**: writable layer size limits enforced at the snapshotter level
-- **Delta tracking**: `fastenv du` measures only the writable layer delta
-- **GC**: TTL-based cleanup, LRU eviction of unused forks, periodic snapshot garbage collection
+The VM is the durable security boundary. Whether the trust domain is a repo,
+tenant, organization, or user should be chosen explicitly.
+
+### Agent sandbox
+
+Inside the VM, `crun` containers provide cheap per-agent isolation:
+
+- private mount namespace
+- private PID namespace
+- overlayfs copy-on-write workspace
+- restricted capabilities
+- per-agent temp and build directories
+
+This layer is optimized for fan-out and workspace cleanliness, not for
+protecting the host on its own.
 
 ---
 
 ## Success criteria
 
-- [ ] Fork creation ≤ 100ms p95
-- [ ] Disk usage per fork proportional only to changes made in that fork
-- [ ] No full workspace duplication across forks
-- [ ] Multiple concurrent forks without disk exhaustion
-- [ ] OCI-compliant implementation (no custom kernel patches, no bespoke runtimes)
-
----
-
-## Benchmarks
-
-The benchmark suite measures:
-
-- Fork creation latency (p50, p95, p99)
-- Exec start latency
-- Writable layer growth rate
-- Disk usage per fork
-- Maximum concurrent forks
-
-Tested against: small repo (<100 files), medium repo (~10k files), large repo (>100k files).
-
----
-
-## Stretch goals
-
-- **Warm fork pool** — pre-created snapshot inventory for sub-10ms fork creation
-- **CRIU integration** — process snapshot/restore to pre-warm agent execution state
-- **Remote lazy-loaded base images** — stargz/nydus remote base, no local pull required
-- **Kubernetes CRI integration** — fastenv as a CRI plugin for cluster-scale agent workloads
-
----
-
-## Non-goals
-
-- Custom filesystem implementation
-- Non-OCI runtimes
-- Git-based isolation (no worktrees)
-- VM-based isolation (no Firecracker)
+- Project boundaries are explicit and enforced by the VM layer.
+- Multiple agents can run concurrently inside a project VM without stomping on
+  each other.
+- The host only receives validated outputs, not live trust in guest
+  workspaces.
+- Agent sandbox creation inside an existing project VM remains fast enough for
+  interactive loops.
 
 ---
 
 ## Context
 
-fastenv is a component of [Superfield](https://github.com/superfield-ai/superfield-cli-ts) — an Agent Integrated Development Environment. In the Superfield Phase 2 architecture, fastenv replaces external CI runners with an embedded feedback loop: agents get a fresh isolated environment per test run, with results in milliseconds rather than minutes.
+fastenv is a component of [Superfield](https://github.com/superfield-ai/superfield-cli-ts) - an Agent Integrated Development Environment. The role of fastenv is to provide the isolation and execution substrate for agent work, while the control plane retains policy and artifact ownership.
 
 Related:
-- [`superfield-ai/sharp`](https://github.com/superfield-ai/sharp) — agent-native VCS, backwards-compatible with Git
-- [`superfield-ai/nexum`](https://github.com/superfield-ai/nexum) — self-improving synthetic corpus for agent skills
+- [`superfield-ai/sharp`](https://github.com/superfield-ai/sharp) - agent-native VCS, backwards-compatible with Git
+- [`superfield-ai/nexum`](https://github.com/superfield-ai/nexum) - self-improving synthetic corpus for agent skills

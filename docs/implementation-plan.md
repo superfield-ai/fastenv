@@ -1,5 +1,10 @@
 # fastenv Rust Rewrite
 
+> Stale plan note: this document still describes the old containerd/overlayfs
+> implementation path. It needs to be re-baselined against
+> [docs/prd.md](docs/prd.md) and [docs/architecture.md](docs/architecture.md)
+> after the Firecracker-per-project architecture change.
+
 ## Goal
 
 Rewrite fastenv from Go to idiomatic Rust, replacing the containerd gRPC

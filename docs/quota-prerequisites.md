@@ -9,10 +9,10 @@
 
 ## How mode is selected
 
-At `fastenv fork` time, fastenv probes `/proc/mounts` for the `prjquota` mount
-option on the device that hosts the containerd snapshot root
-(`/var/lib/containerd` by default). If `prjquota` is found, **hard** mode is
-selected and recorded in the JSON output. Otherwise **soft** mode is used.
+At project VM or workspace provisioning time, fastenv probes `/proc/mounts`
+for the `prjquota` mount option on the host volume that stores the VM disk
+image or workspace data. If `prjquota` is found, **hard** mode is selected and
+recorded in the JSON output. Otherwise **soft** mode is used.
 
 The mode is logged as a structured field:
 
@@ -23,35 +23,36 @@ The mode is logged as a structured field:
 
 ## Enabling hard quota enforcement (ext4)
 
-1. Ensure your containerd data partition is formatted as ext4. Check with:
+1. Ensure the host volume backing project VM storage is formatted as ext4.
+   Check with:
 
    ```bash
-   df -T /var/lib/containerd
+   df -T /var/lib/fastenv
    ```
 
 2. Add the `prjquota` option to `/etc/fstab` for that partition:
 
    ```
-   /dev/sdX  /var/lib/containerd  ext4  defaults,prjquota  0 2
+   /dev/sdX  /var/lib/fastenv  ext4  defaults,prjquota  0 2
    ```
 
 3. Remount the filesystem:
 
    ```bash
-   sudo mount -o remount,prjquota /var/lib/containerd
+   sudo mount -o remount,prjquota /var/lib/fastenv
    ```
 
 4. Initialise quota accounting:
 
    ```bash
-   sudo quotacheck -Pug /var/lib/containerd
-   sudo quotaon -P /var/lib/containerd
+   sudo quotacheck -Pug /var/lib/fastenv
+   sudo quotaon -P /var/lib/fastenv
    ```
 
 5. Verify:
 
    ```bash
-   sudo repquota -Ps /var/lib/containerd
+   sudo repquota -Ps /var/lib/fastenv
    ```
 
 ## Enabling hard quota enforcement (xfs)
@@ -60,13 +61,13 @@ XFS includes project quota support in its default kernel module. Mount with
 `prjquota`:
 
 ```
-/dev/sdX  /var/lib/containerd  xfs  defaults,prjquota  0 2
+/dev/sdX  /var/lib/fastenv  xfs  defaults,prjquota  0 2
 ```
 
 Then remount:
 
 ```bash
-sudo mount -o remount,prjquota /var/lib/containerd
+sudo mount -o remount,prjquota /var/lib/fastenv
 ```
 
 ## Soft mode — no host changes needed
@@ -85,6 +86,6 @@ fastenv du agent-1
 
 ## Canonical docs
 
-- [Architecture §5 OD-4](architecture.md)
+- [Architecture §8 OD-4](architecture.md)
 - [PRD](prd.md)
 - [Implementation plan Phase 5](implementation-plan.md)

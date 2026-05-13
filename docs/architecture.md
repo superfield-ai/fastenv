@@ -2,180 +2,229 @@
 
 ## 1. Overview
 
-fastenv is a Linux daemon-free CLI that provides OCI-native copy-on-write
-workspace forking for AI agents. It creates isolated execution environments in
-≤100ms p95 by applying overlayfs mounts directly via kernel syscalls, without
-routing through a container daemon. Each fork is a thin writable layer on top
-of a shared read-only base; only writes are tracked per fork. fastenv is
-implemented in Rust and targets a minimalist dependency footprint: no gRPC, no
-container daemon, no protobuf — only kernel interfaces and a small set of
-well-audited crates.
+fastenv is a host/control-plane plus project-VM system. The host runs the
+scheduler, Firecracker supervisor, secret broker, artifact validator, and
+policy monitors. Each project gets one Firecracker microVM as the durable
+security boundary. Inside that VM, agent work runs in `crun` containers.
 
----
+The architecture is intentionally layered:
 
-## 2. Technology Stack
+```text
+Physical host
+  - scheduler
+  - Firecracker supervisor
+  - image/cache service
+  - artifact collector
+  - host eBPF monitor
+  - host cgroups / jailer / seccomp
 
-| Layer | Choice | Rationale | Source |
-|-------|--------|-----------|--------|
-| Language | Rust (stable) | Predictable latency (no GC pauses), zero-cost syscall wrappers, single static binary, org-wide Rust consolidation | Superfield org direction |
-| CLI | `clap` (derive API) | Idiomatic Rust CLI; feature-equivalent to cobra | This doc |
-| Syscall interface | `rustix` | Safe, audited Linux syscall bindings; covers `mount(2)`, `statfs(2)`, `ioctl` (project quota), `flock(2)` | This doc |
-| Async runtime | `tokio` | Required for concurrent fork operations; gates exec I/O forwarding | This doc |
-| Structured logging | `tracing` + `tracing-subscriber` (JSON layer) | Structured JSON output matching existing log schema; zero-overhead when disabled | README, Go prototype |
-| Serialization | `serde` + `serde_json` | Registry file, snapshot metadata, CLI JSON output | This doc |
-| OCI types | `oci-spec` | OCI image config and manifest types; avoids hand-rolling spec structs | This doc |
-| Tar / layer I/O | `tar` crate | OCI layer archive read/write for `build-base` | This doc |
-| Content addressing | `sha2` + `hex` | SHA-256 digests for OCI layer and config blobs | This doc |
-| OCI runtime | `crun` (external binary) | OCI-compliant, fast (~2–3× faster exec init than runc), no shim required in direct-invoke mode | Phase 1 scout §2 |
-| Quota enforcement | `rustix` ioctl (`FS_IOC_FSSETXATTR`) | Kernel project-quota assignment on ext4/xfs; soft fallback when unavailable | scout §4, quota-prerequisites.md |
+Project microVM
+  - one repo / tenant / project security domain
+  - guest kernel
+  - project filesystem
+  - project-local package caches
+  - project-local network policy
+  - optional guest eBPF monitor
 
----
-
-## 3. Data Layout
-
-All fastenv state lives under a configurable root (default `/var/lib/fastenv`):
-
-```
-/var/lib/fastenv/
-  bases/<base-key>/
-    lower/          ← extracted base layer tree (read-only; bind-mounted as overlayfs lower)
-    meta.json       ← OCI image config digest, creation timestamp, labels
-  forks/<fork-key>/
-    upper/          ← per-fork writable delta (overlayfs upper dir)
-    work/           ← overlayfs work dir (must be same filesystem as upper/)
-    merged/         ← optional mount point for mount-path subcommand (virtiofsd)
-    meta.json       ← base ref, quota bytes, quota mode, creation timestamp, labels
-  registry.json     ← index of all bases and forks; write-locked via flock(2)
-  content/
-    blobs/sha256/<digest>  ← content-addressed OCI layer and config blobs
+Agent container inside VM
+  - crun
+  - overlayfs CoW workspace
+  - private mount and PID namespaces
+  - restricted capabilities
+  - per-agent workspace and temp/build dirs
 ```
 
-### Fork operation (kernel path)
+The host does not execute project code directly.
 
+---
+
+## 2. Trust Boundaries
+
+### Host boundary
+
+Goal: a compromised project must not compromise the host or other projects.
+
+Host responsibilities:
+
+- schedule projects and agent runs
+- start and stop Firecracker VMs
+- broker secrets
+- collect artifacts and patches
+- enforce host-side policy and network attachment
+- observe host-level behavior through eBPF
+
+### Project boundary
+
+Goal: one project VM contains one trust domain, such as a repo, tenant, or
+other explicitly chosen grouping.
+
+Project VM responsibilities:
+
+- hold the guest kernel boundary
+- maintain project-local caches
+- apply project-level network policy
+- optionally run guest eBPF for audit and policy
+
+### Agent boundary
+
+Goal: one agent should not corrupt another agent's workspace or runtime state.
+
+Agent container responsibilities:
+
+- isolate filesystem writes with overlayfs
+- isolate the process tree
+- apply per-agent resource controls
+- keep temp and build directories separate
+
+---
+
+## 3. Filesystem Layout
+
+The host should see only VM-level state, not live project workspaces.
+
+Host-side layout:
+
+```text
+/var/lib/fastenv/vms/<project-id>/
+  firecracker.sock
+  kernel
+  rootfs.img
+  workspace.img
+  logs/
+  artifacts/
+  state.json
 ```
-mkdir upper/ work/
-mount -t overlay -o lowerdir=<base>/lower,upperdir=upper,workdir=work none merged/
+
+Guest-side layout:
+
+```text
+/project/
+  repo.git
+  worktrees/
+    <agent-id>/
+  containers/
+    <agent-id>/
+      upper/
+      work/
+      merged/
+  cache/
+  artifacts/
 ```
 
-This is a single `mount(2)` syscall. No daemon round-trip. Target: < 5ms.
-
-### Exec operation (crun direct)
-
-1. Construct a minimal OCI bundle under a temp directory: `config.json` (OCI
-   runtime spec) + `rootfs/` symlink pointing to the fork's `merged/` dir.
-2. `crun run --bundle <tmpdir> <fork-key>`.
-3. Wait for exit; forward stdio. Delete bundle dir on exit.
-4. The fork's overlayfs snapshot is **not** affected by exec lifecycle.
+The guest owns internal worktree, cache, and container layout. The host only
+deals with the VM image, exported artifacts, and policy data.
 
 ---
 
-## 4. Architectural Constraints
+## 4. Execution Model
 
-**C1 — No container daemon dependency.**
-fastenv must operate without containerd, Docker, or any other container daemon
-running on the host. All snapshot and mount operations go directly through
-kernel interfaces (`mount(2)`, overlayfs). Rationale: minimalist deployment,
-no gRPC overhead, eliminates daemon as operational dependency.
+### Project VM lifecycle
 
-**C2 — OCI compliance.**
-The exec path must use a conformant OCI runtime (crun). OCI image format (tar
-layers, content-addressed manifests) must be preserved for the `build-base`
-output so that images are portable. No custom kernel patches, no bespoke
-runtimes (README non-goals).
+The project VM is long-lived relative to individual agent runs. It may be
+warm-started or kept alive to amortize Firecracker boot cost within a trust
+domain.
 
-**C3 — Linux kernel ≥ 5.11.**
-Required for `userxattr` overlayfs option (`user.overlay.*` xattrs), which is
-needed for rootless-compatible configurations. fastenv probes overlayfs support
-at startup and exits with a clear error if unavailable. Source: Phase 1 scout §3.
+### Agent run lifecycle
 
-**C4 — CAP_SYS_ADMIN or root.**
-`mount(2)` on Linux requires elevated privilege. fastenv documents this as a
-hard requirement. Rootless operation via user namespaces is not a v1 goal.
+An agent run starts by creating a `crun` container inside the VM, attaching an
+overlayfs workspace, and applying resource limits. When the run ends, the
+container is destroyed, but the project VM remains available for the next
+agent.
 
-**C5 — Minimalist dependencies.**
-No gRPC, no protobuf, no async HTTP client, no container SDK. Each crate
-dependency requires explicit justification. The dependency tree must remain
-auditable. Prefer `rustix` over raw `unsafe` syscalls; prefer `serde_json`
-over a custom serialization format.
+### Output flow
 
-**C6 — Advisory locking on registry writes.**
-All writes to `registry.json` must hold an exclusive `flock(2)` lock on a
-`.lock` file in the fastenv root. Reads may proceed without a lock but must
-tolerate stale data from an in-progress write. This allows multiple concurrent
-`fastenv exec` invocations without registry corruption.
+Agent outputs should leave the VM through a controlled channel:
 
-**C7 — Snapshot and task lifecycles are independent.**
-The fork's overlayfs snapshot persists across exec invocations. `fastenv exec`
-creates and destroys the OCI bundle and crun process; it does not modify the
-snapshot. Only `fastenv discard` removes the snapshot.
+- patches
+- logs
+- test reports
+- build artifacts
 
-**C8 — Structured JSON logging.**
-All log output must be newline-delimited JSON matching the schema established
-by the Go prototype: `level`, `ts`, `msg`, and operation-specific fields
-(e.g. `fork_id`, `creation_latency`, `quota_mode`). Human-readable output is
-not a goal.
+The host should validate or at least gate those outputs before merging or
+publishing them.
 
 ---
 
-## 5. Open Decisions
+## 5. Policy Model
 
-**OD-1 — Registry format: JSON file vs. SQLite.**
-A single `registry.json` with `flock` is simple and has no dependency. SQLite
-via `rusqlite` provides atomic transactions and is safer under concurrent
-writers. Recommendation: start with JSON + flock; migrate to SQLite if
-concurrent writer contention is measured in benchmarks.
+### Network
 
-**OD-2 — crun invocation: subprocess vs. libcrun.**
-`crun` can be invoked as an external subprocess (current approach) or linked
-as a C library via FFI. Subprocess is simpler and keeps crun upgradeable
-independently. FFI eliminates one process fork and stdio pipe. Recommendation:
-subprocess for v1; FFI is a future optimisation if exec latency testing shows
-the process fork is on the critical path.
+Network policy is hierarchical:
 
-**OD-3 — Hard quota: ioctl vs. external tool.**
-Project quota assignment after overlayfs `Prepare` can be done via
-`ioctl(FS_IOC_FSSETXATTR)` (in-process, no external binary) or by shelling
-out to `xfs_quota` / `tune2fs`. Recommendation: `ioctl` via `rustix` for
-reliability and to avoid external tool dependency. Source: scout §4.
+- host decides whether a VM has network access at all
+- project VM decides project-level access
+- agent container may further restrict access for a run
 
-**OD-4 — Shared cache layers.**
-The Go prototype committed per-type cache directories (npm, pip, cargo) as
-separate named snapshot layers shared read-only across forks. In the direct
-overlayfs model, this maps to additional lower dirs in the overlayfs mount
-(overlayfs supports multiple lower dirs as a colon-separated list). Decide
-in the `build-base` implementation issue whether to support multi-lower
-cache dirs or defer to v2.
+Useful modes include:
 
----
+- none
+- package-mirror-only
+- allowlist
+- full-egress-audited
 
-## 6. What Containerd Provided (and What Replaced It)
+### Secrets
 
-The Go prototype used containerd as an intermediary. This table records what
-each containerd subsystem did and what replaces it, to prevent re-introduction
-of the dependency.
+Secrets must be short-lived and scoped to the minimum necessary trust domain.
+They should be injected on demand and never baked into base images or mounted
+from host home directories.
 
-| Containerd subsystem | Role in prototype | Replacement |
-|---|---|---|
-| Snapshotter gRPC API | Snapshot create/delete/list | Direct `mount(2)` + `registry.json` |
-| Content store | Content-addressed blob storage | `content/blobs/sha256/<digest>` directory |
-| Image service | Named image → manifest mapping | `bases/<key>/meta.json` |
-| Task API + shim | Exec lifecycle management | `crun run` subprocess |
-| GC machinery | Reference-graph garbage collection | Registry walk + discard |
-| `archive.Diff` helper | Directory → OCI tar layer | `tar` crate + `sha2` |
-| `mount.All()` helper | Apply mount descriptors | `rustix::mount::mount()` |
+### eBPF
 
-The only features containerd provided that are not replaced in v1:
-- Cross-image OCI layer deduplication (content store sharing across base images)
-- Ecosystem interop with `ctr` / `nerdctl`
-- Kubernetes CRI integration (stretch goal, remains open)
+eBPF is a monitoring and policy layer, not the sandbox itself.
+
+- host eBPF watches the Firecracker/jailer boundary and host resources
+- guest eBPF watches agent behavior inside the VM
 
 ---
 
-## 7. Source Coverage
+## 6. Cache Strategy
 
-| Source | Rules applied | Notes |
-|--------|---------------|-------|
-| README.md | C2, C4, OD-4; fork lifecycle, exec isolation, quota, GC, benchmarks | Functions as PRD; no formal `docs/prd.md` exists |
-| docs/scout/phase1-findings.md | C3 (kernel ≥ 5.11), OD-3 (quota ioctl), crun path, overlayfs prereqs | Phase 1 scout is the primary technical reference |
-| docs/quota-prerequisites.md | OD-3, C1 (quota detection without containerd path) | References containerd paths; updated by this doc |
-| Conversation (Rust migration) | C1 (no containerd), C5 (minimalist deps), language choice | Architectural direction set in session |
+Caching should stay within the right trust domain:
+
+- host global cache: templates, kernels, read-only mirror data
+- project VM cache: project-local package caches and Git objects
+- agent container cache: per-run temp and build outputs
+
+Writable caches must not be shared across tenants. Shared read-only seeds are
+acceptable when they do not weaken the trust boundary.
+
+---
+
+## 7. Security and Isolation Invariants
+
+The architecture depends on these invariants:
+
+- Firecracker is the project boundary.
+- `crun` is the agent boundary.
+- eBPF observes and constrains, but does not replace the VM boundary.
+- The host never mounts a writable project workspace directly for untrusted
+  code.
+- Outputs leave the VM only through controlled export paths.
+- Cross-tenant writable caches are disallowed.
+
+---
+
+## 8. Open Decisions
+
+### OD-1 - Boundary key
+
+Should the project VM be keyed by repo, tenant, organization, user, or some
+explicit combination? The answer depends on the operator's trust model, and
+the platform should allow the boundary to be chosen deliberately.
+
+### OD-2 - Workspace transfer
+
+Should a project use copy-in/copy-out by default, or a shared filesystem when
+the project is trusted? The safe default is copy-in/copy-out or a project-local
+disk image, with shared filesystem only for explicitly trusted domains.
+
+### OD-3 - VM reuse
+
+How aggressively should the scheduler reuse warm project VMs? Reuse improves
+latency, but the reuse policy must not blur trust domains.
+
+### OD-4 - Cache seeding
+
+Which caches can be seeded host-side as read-only inputs, and which must remain
+project-local? The rule should be conservative: seed only data that does not
+create writable cross-tenant sharing.
