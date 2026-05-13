@@ -1,6 +1,2 @@
 # Rust build artifacts
 target/
-
-# Go build artifacts
-*.test
-*.out

@@ -1,13 +1,11 @@
 # On-demand benchmark workflow for fastenv.
 #
-# Runs directly on the self-hosted runner host (no container) so that fastenv
-# can reach the k3s-bundled containerd socket and use the host overlayfs mount
-# namespace. Trigger via: Actions → Bench → Run workflow
+# Runs directly on the self-hosted runner host (no container). Trigger via:
+# Actions → Bench → Run workflow
 #
 # Inputs:
-#   base_image  — containerd image name to fork from (must be built with `fastenv build-base`)
+#   base_image  — base image name to fork from (must be built with `fastenv build-base`)
 #   iterations  — number of fork creation samples per percentile measurement
-#   socket      — containerd socket path (k3s default: /run/k3s/containerd/containerd.sock)
 name: Bench
 
 on:
@@ -21,10 +19,6 @@ on:
         description: "Benchmark iterations"
         required: false
         default: "50"
-      socket:
-        description: "containerd socket path"
-        required: false
-        default: "/run/k3s/containerd/containerd.sock"
 
 jobs:
   bench:
@@ -33,21 +27,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache: true
-
       - name: Build fastenv
-        run: go build -o fastenv .
+        run: cargo build --release --bin fastenv
 
       - name: Run benchmark
         id: bench
         run: |
-          sudo ./fastenv bench \
+          sudo ./target/release/fastenv bench \
             --base "${{ inputs.base_image }}" \
-            --socket "${{ inputs.socket }}" \
             --iterations "${{ inputs.iterations }}" \
             | tee bench-results.json
 
