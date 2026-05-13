@@ -36,6 +36,15 @@ Agent container inside VM
 
 The host does not execute project code directly.
 
+The current codebase mirrors that split through an explicit boundary module:
+
+- `HostControlPlane` names the host-side orchestration surface.
+- `GuestRuntime` names the workspace-engine primitive surface that the host
+  can delegate to while the project-VM split is still being carved out.
+- The current CLI routes through `LocalHostControlPlane` and
+  `LocalGuestRuntime` so the seam stays visible in code and tests instead of
+  remaining implicit inside the command handlers.
+
 ---
 
 ## 2. Trust Boundaries

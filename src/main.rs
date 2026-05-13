@@ -6,6 +6,7 @@
 //   - docs/implementation-plan.md
 
 pub mod bench;
+pub mod boundary;
 pub mod build_base;
 pub mod diff;
 pub mod discard;
@@ -21,6 +22,8 @@ pub mod registry;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use boundary::{GuestRuntime, HostControlPlane, LocalHostControlPlane};
 
 /// OCI-native copy-on-write workspace forking for AI agent orchestration.
 #[derive(Parser)]
@@ -153,17 +156,19 @@ fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    let host = LocalHostControlPlane::new();
+    let guest = host.guest();
 
     match cli.command {
         Commands::BuildBase { dir, name } => {
-            build_base::build_base(&dir, &name, &cli.root)?;
+            guest.build_base(&dir, &name, &cli.root)?;
         }
         Commands::Fork { base, name, quota } => {
             let quota_bytes = quota.as_deref().map(quota::parse_quota_size).transpose()?;
-            fork::fork_base(&base, &name, &cli.root, quota_bytes)?;
+            guest.fork_base(&base, &name, &cli.root, quota_bytes)?;
         }
         Commands::Discard { fork_id } => {
-            discard::discard_fork(&fork_id, &cli.root)?;
+            guest.discard_fork(&fork_id, &cli.root)?;
         }
         Commands::Exec {
             fork_id,
@@ -180,17 +185,17 @@ fn main() -> Result<()> {
                 memory,
                 network,
             };
-            let exit_code = exec::run_exec(&fork_id, &command, &cli.root, &opts)?;
+            let exit_code = guest.run_exec(&fork_id, &command, &cli.root, &opts)?;
             std::process::exit(exit_code);
         }
         Commands::Diff { fork_id } => {
-            diff::diff_fork(&fork_id, &cli.root)?;
+            guest.diff_fork(&fork_id, &cli.root)?;
         }
         Commands::Du { fork_id } => {
-            du::du_fork(&fork_id, &cli.root)?;
+            guest.du_fork(&fork_id, &cli.root)?;
         }
         Commands::ExportPatch { fork_id, output } => {
-            export_patch::export_patch(&fork_id, &cli.root, output.as_deref())?;
+            guest.export_patch(&fork_id, &cli.root, output.as_deref())?;
         }
         Commands::Gc {
             max_age,
@@ -204,20 +209,32 @@ fn main() -> Result<()> {
                 max_forks,
                 dry_run,
             };
-            gc::run_gc(&cli.root, &opts)?;
+            guest.run_gc(&cli.root, &opts)?;
         }
         Commands::MountPath { fork_id } => {
-            mount_path::mount_path(&fork_id, &cli.root)?;
+            tracing::warn!(
+                command = "mount-path",
+                fork_id = %fork_id,
+                boundary = "boundary::GuestRuntime",
+                "deprecated CLI entrypoint; use the explicit host/guest boundary"
+            );
+            guest.mount_path(&fork_id, &cli.root)?;
         }
         Commands::Unmount { fork_id } => {
-            mount_path::unmount_fork(&fork_id, &cli.root)?;
+            tracing::warn!(
+                command = "unmount",
+                fork_id = %fork_id,
+                boundary = "boundary::GuestRuntime",
+                "deprecated CLI entrypoint; use the explicit host/guest boundary"
+            );
+            guest.unmount_fork(&fork_id, &cli.root)?;
         }
         Commands::Bench {
             base,
             iterations,
             exec,
         } => {
-            let result = bench::run_bench(
+            let result = guest.run_bench(
                 &base,
                 &cli.root,
                 &bench::BenchOptions {
