@@ -53,6 +53,10 @@ Host responsibilities:
 - enforce host-side policy and network attachment
 - observe host-level behavior through eBPF
 
+Host eBPF programs run in the host kernel. They watch the Firecracker/jailer
+boundary, host files, host devices, and host network paths associated with the
+project VM.
+
 ### Project boundary
 
 Goal: one project VM contains one trust domain, such as a repo, tenant, or
@@ -64,6 +68,10 @@ Project VM responsibilities:
 - maintain project-local caches
 - apply project-level network policy
 - optionally run guest eBPF for audit and policy
+
+Guest eBPF programs run in the guest kernel. They observe and constrain
+activity inside the project VM, including agent containers, without replacing
+the VM boundary itself.
 
 ### Agent boundary
 
@@ -175,6 +183,11 @@ eBPF is a monitoring and policy layer, not the sandbox itself.
 - host eBPF watches the Firecracker/jailer boundary and host resources
 - guest eBPF watches agent behavior inside the VM
 
+The two layers are intentionally separate:
+
+- host eBPF is loaded by the host kernel and only sees host-side state
+- guest eBPF is loaded by the guest kernel and only sees guest-side state
+
 ---
 
 ## 6. Cache Strategy
@@ -197,6 +210,7 @@ The architecture depends on these invariants:
 - Firecracker is the project boundary.
 - `crun` is the agent boundary.
 - eBPF observes and constrains, but does not replace the VM boundary.
+- host and guest eBPF remain distinct kernel-local policy planes.
 - The host never mounts a writable project workspace directly for untrusted
   code.
 - Outputs leave the VM only through controlled export paths.
