@@ -840,18 +840,26 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network-mode").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network-mode")
+                .map(String::as_str),
             Some("none"),
             "network-mode annotation must be 'none'"
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.egress").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.egress")
+                .map(String::as_str),
             Some("blocked"),
             "egress annotation must be 'blocked' for None mode"
         );
         // Private network namespace must be present.
         assert!(
-            config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "None mode must have a private network namespace"
         );
     }
@@ -866,21 +874,31 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network-mode").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network-mode")
+                .map(String::as_str),
             Some("package-mirror-only"),
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.purpose").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.purpose")
+                .map(String::as_str),
             Some("package-mirror"),
             "purpose annotation must be 'package-mirror'"
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.egress").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.egress")
+                .map(String::as_str),
             Some("restricted"),
             "egress annotation must be 'restricted' for PackageMirrorOnly mode"
         );
         assert!(
-            config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "PackageMirrorOnly mode must have a private network namespace"
         );
     }
@@ -895,21 +913,31 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network-mode").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network-mode")
+                .map(String::as_str),
             Some("allowlist"),
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.purpose").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.purpose")
+                .map(String::as_str),
             Some("allowlist"),
             "purpose annotation must be 'allowlist'"
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.egress").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.egress")
+                .map(String::as_str),
             Some("restricted"),
             "egress annotation must be 'restricted' for Allowlist mode"
         );
         assert!(
-            config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "Allowlist mode must have a private network namespace"
         );
     }
@@ -924,21 +952,31 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network-mode").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network-mode")
+                .map(String::as_str),
             Some("audited-egress"),
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.purpose").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.purpose")
+                .map(String::as_str),
             Some("audited-egress"),
             "purpose annotation must be 'audited-egress'"
         );
         assert_eq!(
-            annotations.get("fastenv.guest.network.egress").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.egress")
+                .map(String::as_str),
             Some("audited"),
             "egress annotation must be 'audited' for AuditedEgress mode"
         );
         assert!(
-            config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "AuditedEgress mode must have a private network namespace"
         );
     }
@@ -952,17 +990,25 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network-mode").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network-mode")
+                .map(String::as_str),
             Some("host"),
         );
         assert_eq!(
-            annotations.get("fastenv.guest.policy-loader").map(String::as_str),
+            annotations
+                .get("fastenv.guest.policy-loader")
+                .map(String::as_str),
             Some("deferred"),
             "Host mode must have deferred policy-loader annotation"
         );
         // No private network namespace for Host mode.
         assert!(
-            !config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            !config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "Host mode must NOT have a private network namespace"
         );
         // Host mode must not have egress annotation.
@@ -1030,7 +1076,12 @@ mod tests {
         // ping should fail (no external route in isolated netns)
         let exit_code = run_exec(
             "none-test",
-            &["ping".to_owned(), "-c1".to_owned(), "-W1".to_owned(), "8.8.8.8".to_owned()],
+            &[
+                "ping".to_owned(),
+                "-c1".to_owned(),
+                "-W1".to_owned(),
+                "8.8.8.8".to_owned(),
+            ],
             root.path(),
             &opts,
         )
@@ -1056,7 +1107,11 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         // Verify config has network namespace before we would hand it to crun.
         assert!(
-            config.linux.namespaces.iter().any(|n| n.ns_type == "network"),
+            config
+                .linux
+                .namespaces
+                .iter()
+                .any(|n| n.ns_type == "network"),
             "PackageMirrorOnly OCI config must have a private network namespace entry"
         );
     }
@@ -1078,7 +1133,9 @@ mod tests {
         let config = build_oci_config("agent-1", &command, &merged, &opts);
         let annotations = config.annotations.as_ref().expect("annotations missing");
         assert_eq!(
-            annotations.get("fastenv.guest.network.egress").map(String::as_str),
+            annotations
+                .get("fastenv.guest.network.egress")
+                .map(String::as_str),
             Some("audited"),
             "AuditedEgress config must carry egress=audited annotation"
         );
