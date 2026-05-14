@@ -143,11 +143,25 @@ pub struct ArtifactRecord {
 }
 
 /// Host eBPF policy metadata attached at the Firecracker/jailer boundary.
+///
+/// After `load_host_ebpf_policy` succeeds the optional fields (`tc_attach_handle`,
+/// `pin_path`, `loaded_at`) are populated with the data needed to detach the
+/// program on VM stop or destroy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostEbpfPolicy {
     pub name: String,
     pub attach_point: String,
     pub object_path: PathBuf,
+    /// TC filter handle (format `"tc:<dev>:<direction>"`) if the program was
+    /// attached as a TC classifier.  `None` for non-TC programs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tc_attach_handle: Option<String>,
+    /// BPF filesystem pin path if the program was pinned (non-TC programs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin_path: Option<String>,
+    /// RFC-3339 timestamp recorded when the program was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_at: Option<String>,
 }
 
 /// Input used to provision a project VM record.
@@ -338,6 +352,8 @@ impl ProjectVmSupervisor {
                     }
                     .into());
                 }
+                // Detach any loaded host eBPF programs before stopping the VM.
+                detach_host_ebpf_if_loaded(project_id, &record);
                 stop_firecracker(&mut record, config)?;
             }
             VmState::Provisioned => {
@@ -400,6 +416,26 @@ impl ProjectVmSupervisor {
         Ok(record)
     }
 
+    /// Load and attach a host eBPF policy program at the Firecracker/jailer boundary.
+    ///
+    /// This method calls into `host_ebpf::load_and_attach_host_ebpf` to
+    /// perform the real `bpf(2)` syscall, load the BPF program into the host
+    /// kernel, and attach it at the specified `attach_point`.
+    ///
+    /// The `policy.attach_point` field encodes the attach type and target:
+    ///
+    /// - `"tc-ingress:<dev>"` / `"tc-egress:<dev>"` — TC classifier
+    /// - `"tracepoint:<cat>/<evt>"` — kernel tracepoint
+    /// - `"kprobe:<func>"` — kprobe on a kernel function
+    ///
+    /// On success the `HostEbpfPolicy` record is updated with the loaded program
+    /// metadata (`tc_attach_handle`, `pin_path`, `loaded_at`) and persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BPF program cannot be loaded (e.g. `CAP_BPF`
+    /// is not held, the ELF object is malformed, or the verifier rejects the
+    /// program).
     pub fn load_host_ebpf_policy(
         &self,
         root: &Path,
@@ -407,7 +443,32 @@ impl ProjectVmSupervisor {
         policy: HostEbpfPolicy,
     ) -> Result<ProjectVmRecord> {
         let mut record = self.load_project_vm(root, project_id)?;
-        record.host_ebpf_policy = Some(policy);
+
+        // Perform the real BPF program load and attach.
+        let loaded = crate::host_ebpf::load_and_attach_host_ebpf(
+            project_id,
+            &policy.name,
+            &policy.object_path,
+            &policy.attach_point,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load host eBPF policy '{}' for project '{}'",
+                policy.name, project_id
+            )
+        })?;
+
+        // Persist the updated policy metadata including attach state.
+        let updated_policy = HostEbpfPolicy {
+            name: policy.name,
+            attach_point: policy.attach_point,
+            object_path: policy.object_path,
+            tc_attach_handle: loaded.tc_handle,
+            pin_path: loaded.pin_path.map(|p| p.to_string_lossy().into_owned()),
+            loaded_at: Some(loaded.loaded_at),
+        };
+
+        record.host_ebpf_policy = Some(updated_policy);
         record.updated_at = now_rfc3339();
         persist_record(root, &record)?;
         Ok(record)
@@ -432,6 +493,9 @@ impl ProjectVmSupervisor {
                 project_id
             );
         }
+
+        // Detach any loaded host eBPF programs before removing the VM record.
+        detach_host_ebpf_if_loaded(project_id, &record);
 
         let dir = vm_dir(root, project_id);
         if dir.exists() {
@@ -492,6 +556,24 @@ impl ProjectVmSupervisor {
         let record: ProjectVmRecord = serde_json::from_reader(file)
             .with_context(|| format!("cannot parse project VM state: {}", path.display()))?;
         Ok(record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eBPF teardown helper
+// ---------------------------------------------------------------------------
+
+/// Detach the host eBPF program for a VM if one is loaded.
+///
+/// This is called from both `transition_vm_state(Stopped)` and
+/// `destroy_project_vm` to ensure eBPF programs are removed from the host
+/// kernel when the VM is torn down.
+///
+/// Errors from eBPF detach are logged as warnings and do not fail the
+/// calling operation (VM teardown should proceed even if eBPF cleanup fails).
+fn detach_host_ebpf_if_loaded(project_id: &str, record: &ProjectVmRecord) {
+    if let Some(policy) = &record.host_ebpf_policy {
+        crate::host_ebpf::detach_host_ebpf(project_id, &policy.name, policy);
     }
 }
 
@@ -1173,23 +1255,87 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Verify that the `host_ebpf_policy` field round-trips through JSON
+    /// serialisation without data loss.
+    ///
+    /// This test does NOT call `load_host_ebpf_policy` (which requires CAP_BPF
+    /// and a real BPF object). Instead it writes the policy metadata directly
+    /// into a provisioned record and verifies it survives persist→load.
     #[test]
-    fn load_host_ebpf_policy_persists() {
+    fn host_ebpf_policy_metadata_round_trips() {
         let dir = TempDir::new().unwrap();
         provision(dir.path(), "proj-h");
         let supervisor = ProjectVmSupervisor;
+
+        // Manually inject policy metadata (simulates what the real loader
+        // would write after a successful bpf(2) load).
+        let mut record = supervisor.get_project_vm(dir.path(), "proj-h").unwrap();
+        record.host_ebpf_policy = Some(HostEbpfPolicy {
+            name: "egress-filter".to_string(),
+            attach_point: "tc-egress:tap0".to_string(),
+            object_path: PathBuf::from("/usr/lib/fastenv/egress.bpf.o"),
+            tc_attach_handle: Some("tc:tap0:egress".to_string()),
+            pin_path: None,
+            loaded_at: Some("2026-01-01T00:00:00Z".to_string()),
+        });
+        persist_record(dir.path(), &record).unwrap();
+
+        // Reload from disk and verify all fields survived JSON round-trip.
+        let loaded = supervisor.get_project_vm(dir.path(), "proj-h").unwrap();
+        let policy = loaded.host_ebpf_policy.expect("policy should be set");
+        assert_eq!(policy.name, "egress-filter");
+        assert_eq!(policy.attach_point, "tc-egress:tap0");
+        assert_eq!(policy.tc_attach_handle.as_deref(), Some("tc:tap0:egress"));
+        assert!(policy.loaded_at.is_some());
+    }
+
+    /// Integration test: load_host_ebpf_policy performs a real bpf(2) syscall.
+    ///
+    /// This test requires:
+    /// - A real BPF ELF object file (TC classifier) at the path given by the
+    ///   `FASTENV_TEST_BPF_OBJECT` environment variable.
+    /// - CAP_BPF or CAP_SYS_ADMIN (run as root or with the `bpf` capability).
+    /// - A network device named by `FASTENV_TEST_BPF_DEVICE` (default: `lo`).
+    ///
+    /// Run with:
+    ///   sudo FASTENV_TEST_BPF_OBJECT=/path/to/prog.bpf.o cargo test \
+    ///       host_ebpf_load_real_bpf_program -- --include-ignored
+    #[test]
+    #[ignore = "requires CAP_BPF and a real BPF ELF object (privileged runner only)"]
+    fn host_ebpf_load_real_bpf_program() {
+        let object_path = std::env::var("FASTENV_TEST_BPF_OBJECT")
+            .unwrap_or_else(|_| "/tmp/test-prog.bpf.o".to_string());
+        let device = std::env::var("FASTENV_TEST_BPF_DEVICE").unwrap_or_else(|_| "lo".to_string());
+
+        let dir = TempDir::new().unwrap();
+        provision(dir.path(), "proj-bpf-integ");
+        let supervisor = ProjectVmSupervisor;
+
         let updated = supervisor
             .load_host_ebpf_policy(
                 dir.path(),
-                "proj-h",
+                "proj-bpf-integ",
                 HostEbpfPolicy {
-                    name: "egress-filter".to_string(),
-                    attach_point: "tc-egress".to_string(),
-                    object_path: PathBuf::from("/usr/lib/fastenv/egress.bpf.o"),
+                    name: "test-classifier".to_string(),
+                    attach_point: format!("tc-egress:{}", device),
+                    object_path: PathBuf::from(&object_path),
+                    tc_attach_handle: None,
+                    pin_path: None,
+                    loaded_at: None,
                 },
             )
-            .unwrap();
-        assert!(updated.host_ebpf_policy.is_some());
+            .expect("load_host_ebpf_policy should succeed with CAP_BPF and a real object");
+
+        let policy = updated.host_ebpf_policy.expect("policy should be set");
+        assert_eq!(policy.name, "test-classifier");
+        assert!(
+            policy.loaded_at.is_some(),
+            "loaded_at must be set after real load"
+        );
+        assert!(
+            policy.tc_attach_handle.is_some(),
+            "tc_attach_handle must be set for TC programs"
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -388,20 +388,11 @@ mod tests {
             .unwrap();
         assert_eq!(record.artifacts.len(), 1);
 
-        let record = host
-            .supervisor()
-            .load_host_ebpf_policy(
-                root.path(),
-                "project-1",
-                HostEbpfPolicy {
-                    name: "firecracker-boundary".to_owned(),
-                    attach_point: "firecracker/jailer".to_owned(),
-                    object_path: root.path().join("policy.o"),
-                },
-            )
-            .unwrap();
-        assert!(record.host_ebpf_policy.is_some());
-
+        // Note: load_host_ebpf_policy now performs a real bpf(2) syscall to
+        // load the program into the host kernel. It requires CAP_BPF and a
+        // real BPF ELF object. That integration test is in the
+        // `host_ebpf_load_and_attach` integration test (privileged runner only).
+        // Here we only verify the record fields set by the preceding operations.
         let stored = host
             .supervisor()
             .get_project_vm(root.path(), "project-1")
@@ -411,7 +402,9 @@ mod tests {
         assert_ne!(stored.state, VmState::Running);
         assert_eq!(stored.secrets.len(), 1);
         assert_eq!(stored.artifacts.len(), 1);
-        assert!(stored.host_ebpf_policy.is_some());
+        // eBPF policy is None until load_host_ebpf_policy is called on a
+        // privileged runner with a real BPF object file.
+        assert!(stored.host_ebpf_policy.is_none());
     }
 
     #[test]
