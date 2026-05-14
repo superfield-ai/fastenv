@@ -29,6 +29,7 @@ use chrono::Utc;
 use clap::ValueEnum;
 use serde::Serialize;
 
+use crate::guest_ebpf::{GuestAuditEvent, GuestEbpfLoader, GuestEbpfPolicy};
 use crate::host_control_plane::SecretLease;
 use crate::registry::{Registry, RegistryError};
 
@@ -214,6 +215,19 @@ pub fn run_exec(fork_id: &str, command: &[String], root: &Path, opts: &ExecOptio
     std::fs::write(&config_path, &config_bytes)
         .with_context(|| format!("exec: failed to write {}", config_path.display()))?;
 
+    // ── 3b. Attach guest eBPF policy loader ──────────────────────────────────
+    // The loader is attached before the container spawns and detached after the
+    // container exits, regardless of success or error. On kernels that do not
+    // support BPF (e.g. Firecracker quickstart kernel 4.14.174), the loader
+    // degrades gracefully to synthetic lifecycle events — it never blocks exec.
+    //
+    // Integration note (docs/scout/guest-ebpf-findings.md §1):
+    //   Current quickstart kernel 4.14.174 lacks CONFIG_DEBUG_INFO_BTF; the
+    //   loader will emit guest_ebpf.loader_unavailable and continue.
+    //   A real guest kernel ≥ 5.7 is required for BPF attachment.
+    let ebpf_policy = GuestEbpfPolicy::for_container(fork_id);
+    let ebpf_loader = GuestEbpfLoader::attach(&ebpf_policy);
+
     // ── 4. Spawn crun subprocess ─────────────────────────────────────────────
     // Inherit stdin/stdout/stderr from the parent process.
     // Container ID = fork_id (must be unique per running container).
@@ -273,7 +287,21 @@ pub fn run_exec(fork_id: &str, command: &[String], root: &Path, opts: &ExecOptio
             "audited-egress: container lifecycle recorded; \
              per-connection events require nftables NFLOG or eBPF attachment"
         );
+        // Also emit through the guest eBPF audit channel so the audit trail
+        // is unified regardless of whether a real BPF program is loaded.
+        ebpf_loader.emit_audit_event(GuestAuditEvent::NetworkEgress, Some("container_exited"));
     }
+
+    // ── 6b. Emit guest eBPF lifecycle audit event and detach ─────────────────
+    // Emit a file-write lifecycle event (represents the "container ran" audit
+    // boundary for the current observe-only iteration). In a future iteration
+    // this will be driven by real BPF tracepoint captures.
+    ebpf_loader.emit_audit_event(
+        GuestAuditEvent::FileWrite,
+        Some(&format!("container_exited:exit_code={}", exit_code)),
+    );
+    // Detach the loader cleanly: closes BPF fds, removes pin files.
+    ebpf_loader.detach();
 
     // ── 7. Bundle cleanup via RAII drop ──────────────────────────────────────
     // bundle_dir is dropped here, removing the tmpdir.
