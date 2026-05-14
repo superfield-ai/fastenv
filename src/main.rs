@@ -16,6 +16,7 @@ pub mod export_patch;
 pub mod fork;
 pub mod gc;
 pub mod host_control_plane;
+pub mod host_ebpf;
 pub mod mount_path;
 pub mod parity_check;
 pub mod quota;
