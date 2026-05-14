@@ -212,6 +212,8 @@ pub struct FirecrackerConfig {
     pub socket_wait_timeout_secs: u64,
     /// Default kernel boot arguments passed to Firecracker.
     pub boot_args: String,
+    /// Seconds to wait for a graceful shutdown before sending SIGKILL.
+    pub stop_timeout_secs: u64,
 }
 
 impl Default for FirecrackerConfig {
@@ -222,6 +224,7 @@ impl Default for FirecrackerConfig {
             mem_size_mib: 128,
             socket_wait_timeout_secs: 10,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
+            stop_timeout_secs: 10,
         }
     }
 }
@@ -317,6 +320,10 @@ impl ProjectVmSupervisor {
                 boot_firecracker(&mut record, config)?;
             }
             VmState::Stopped => {
+                // Idempotent: if already Stopped, return the record as-is.
+                if record.state == VmState::Stopped {
+                    return Ok(record);
+                }
                 if record.state != VmState::Running {
                     return Err(VmBootError::NotRunning {
                         project_id: project_id.to_string(),
@@ -324,7 +331,7 @@ impl ProjectVmSupervisor {
                     }
                     .into());
                 }
-                stop_firecracker(&mut record)?;
+                stop_firecracker(&mut record, config)?;
             }
             VmState::Provisioned => {
                 // No process interaction required for a reset to Provisioned.
@@ -397,6 +404,39 @@ impl ProjectVmSupervisor {
         record.updated_at = now_rfc3339();
         persist_record(root, &record)?;
         Ok(record)
+    }
+
+    /// Destroy a project VM: removes the VM directory layout and the registry
+    /// entry (`state.json`).
+    ///
+    /// The VM must be in the `Stopped` or `Provisioned` state before calling
+    /// `destroy_project_vm`. Call `transition_vm_state(Stopped)` first to
+    /// gracefully stop a running VM.
+    ///
+    /// After this call the `project_id` no longer has a record on disk and any
+    /// subsequent `get_project_vm` or `transition_vm_state` call will return an
+    /// error.
+    pub fn destroy_project_vm(&self, root: &Path, project_id: &str) -> Result<()> {
+        let record = self.load_project_vm(root, project_id)?;
+
+        if record.state == VmState::Running {
+            bail!(
+                "cannot destroy project VM '{}': VM is still Running; stop it first",
+                project_id
+            );
+        }
+
+        let dir = vm_dir(root, project_id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| {
+                format!(
+                    "cannot remove VM directory '{}': check permissions",
+                    dir.display()
+                )
+            })?;
+        }
+
+        Ok(())
     }
 
     fn create_project_vm(&self, root: &Path, spec: &ProjectVmSpec) -> Result<ProjectVmRecord> {
@@ -593,9 +633,25 @@ fn boot_firecracker(record: &mut ProjectVmRecord, config: &FirecrackerConfig) ->
         &serde_json::json!({"action_type": "InstanceStart"}),
     )?;
 
-    // 8. Mark the record as Running. The child handle is intentionally
-    //    dropped here; the Firecracker process becomes a daemon attached to
-    //    the socket. A follow-up issue will add a PID file for clean tracking.
+    // 8. Write a PID file so stop_firecracker can force-kill the process if
+    //    graceful shutdown does not complete within the timeout.
+    let pid = child.id();
+    let pid_path = pid_path_for_record(record);
+    if let Err(e) = fs::write(&pid_path, pid.to_string()) {
+        // Non-fatal: log to the Firecracker log but continue. Force-kill will
+        // not be available, but graceful stop will still work.
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .map(|mut f| {
+                let _ = writeln!(f, "warning: cannot write PID file {}: {}", pid_path.display(), e);
+            });
+    }
+
+    // 9. Mark the record as Running. The child handle is dropped; the
+    //    Firecracker process continues running as a background process.
+    //    The PID file written above allows stop_firecracker to force-kill it.
     drop(child);
     record.state = VmState::Running;
 
@@ -603,38 +659,73 @@ fn boot_firecracker(record: &mut ProjectVmRecord, config: &FirecrackerConfig) ->
 }
 
 /// Send a graceful shutdown to a running Firecracker VM via its API socket,
-/// then wait for the process to exit.
+/// wait for the process to exit, and clean up the socket and PID files.
 ///
-/// The shutdown is triggered by `PUT /actions` with `action_type: SendCtrlAltDel`.
-/// If the socket is gone (process already exited), the state is set to Stopped
-/// without error.
-fn stop_firecracker(record: &mut ProjectVmRecord) -> Result<()> {
+/// Shutdown sequence:
+/// 1. Send `PUT /actions` with `action_type: SendCtrlAltDel` for a clean guest
+///    shutdown (Firecracker closes the API socket when the VM halts).
+/// 2. Poll for the socket to disappear (which indicates process exit) for up
+///    to `config.stop_timeout_secs`.
+/// 3. If the socket is still present after the timeout, force-kill the process
+///    using the PID recorded in the `firecracker.pid` file.
+/// 4. Remove the socket file and the PID file regardless.
+///
+/// If the socket was already gone (process exited before we were called), skip
+/// steps 1–3 and proceed directly to state update.
+fn stop_firecracker(record: &mut ProjectVmRecord, config: &FirecrackerConfig) -> Result<()> {
     let sock = &record.firecracker_sock;
 
     if sock.exists() {
         let sock_str = sock.to_string_lossy();
         // SendCtrlAltDel triggers a clean guest shutdown in Firecracker.
-        // We ignore errors here because the process may have already exited.
+        // Errors are ignored: the process may have already exited.
         let _ = firecracker_api_put(
             &sock_str,
             "/actions",
             &serde_json::json!({"action_type": "SendCtrlAltDel"}),
         );
 
-        // Wait briefly for the socket to disappear (process exit).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Poll for the socket to disappear (process exit indicator).
+        let deadline = Instant::now() + Duration::from_secs(config.stop_timeout_secs);
         while sock.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(200));
         }
 
-        // Remove the socket file if still present.
+        // If the socket is still present, the process did not exit gracefully
+        // within the timeout. Force-kill it via the PID file.
         if sock.exists() {
+            let pid_file = pid_path_for_record(record);
+            if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    // SAFETY: kill(2) with SIGKILL. nix is not a dependency;
+                    // we use std::process::Command to invoke `kill -9`.
+                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                }
+            }
+
+            // Give the OS a moment to reap the process after SIGKILL.
+            thread::sleep(Duration::from_millis(200));
+
+            // Remove the socket file left behind by the killed process.
             let _ = fs::remove_file(sock);
         }
+
+        // Remove the PID file now that the process is gone.
+        let pid_file = pid_path_for_record(record);
+        let _ = fs::remove_file(&pid_file);
     }
 
     record.state = VmState::Stopped;
     Ok(())
+}
+
+/// Return the path of the PID file for a given VM record.
+///
+/// The PID file lives alongside `state.json` in the VM directory as
+/// `firecracker.pid`. It contains the decimal PID of the running Firecracker
+/// process and is created by `boot_firecracker` and removed by `stop_firecracker`.
+fn pid_path_for_record(record: &ProjectVmRecord) -> PathBuf {
+    record.vm_dir.join("firecracker.pid")
 }
 
 /// Wait for the Firecracker API socket to appear on disk, polling at 100ms
@@ -1091,32 +1182,6 @@ mod tests {
     // VM boot tests using mock binary
     // -------------------------------------------------------------------------
 
-    /// Write a shell script to `path` that acts as a minimal mock Firecracker:
-    /// it creates the socket file at `--api-sock` and then sleeps indefinitely.
-    fn write_mock_firecracker_creates_socket(path: &Path) {
-        let script = r#"#!/bin/sh
-# Minimal mock Firecracker: parse --api-sock, create the socket file, then sleep.
-while [ $# -gt 0 ]; do
-    if [ "$1" = "--api-sock" ]; then
-        SOCK="$2"
-        shift 2
-    else
-        shift
-    fi
-done
-if [ -n "$SOCK" ]; then
-    # Create a plain file at the socket path to simulate socket appearance.
-    touch "$SOCK"
-fi
-sleep 30
-"#;
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        let mut perms = f.metadata().unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).unwrap();
-    }
-
     /// Write a mock Firecracker that exits immediately with status 1 (simulates
     /// KVM unavailable or binary failure).
     fn write_mock_firecracker_exits_immediately(path: &Path) {
@@ -1140,6 +1205,7 @@ exit 1
             mem_size_mib: 128,
             socket_wait_timeout_secs: 3,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
+            stop_timeout_secs: 2,
         }
     }
 
@@ -1270,5 +1336,216 @@ exit 1
         let (body, code) = split_curl_output(raw);
         assert_eq!(body, "000");
         assert_eq!(code, "000");
+    }
+
+    // -------------------------------------------------------------------------
+    // Stop, teardown, and destroy tests
+    // -------------------------------------------------------------------------
+
+    /// Calling `transition_vm_state(Stopped)` on a VM that is already Stopped
+    /// must succeed without error (idempotent behaviour).
+    #[test]
+    fn stop_already_stopped_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        provision(dir.path(), "proj-stop-idem");
+
+        let supervisor = ProjectVmSupervisor;
+
+        // Manually write a Stopped state record.
+        let mut record = supervisor
+            .get_project_vm(dir.path(), "proj-stop-idem")
+            .unwrap();
+        record.state = VmState::Stopped;
+        persist_record(dir.path(), &record).unwrap();
+
+        // Stopping a Stopped VM should succeed.
+        let config = test_config(PathBuf::from("/nonexistent/firecracker"));
+        let result = supervisor.transition_vm_state_with_config(
+            dir.path(),
+            "proj-stop-idem",
+            VmState::Stopped,
+            &config,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert_eq!(result.unwrap().state, VmState::Stopped);
+    }
+
+    /// `destroy_project_vm` must remove the VM directory and `state.json`.
+    #[test]
+    fn destroy_removes_vm_dir_and_state_json() {
+        let dir = TempDir::new().unwrap();
+        let record = provision(dir.path(), "proj-destroy-1");
+
+        // Confirm the vm_dir and state_path exist before destroy.
+        assert!(record.vm_dir.exists());
+        assert!(record.state_path.exists());
+
+        let supervisor = ProjectVmSupervisor;
+        supervisor
+            .destroy_project_vm(dir.path(), "proj-destroy-1")
+            .expect("destroy should succeed");
+
+        // Both the vm_dir (which contains state.json) and the state.json file
+        // should be gone after destroy.
+        assert!(!record.vm_dir.exists(), "vm_dir should be removed");
+        assert!(!record.state_path.exists(), "state.json should be removed");
+
+        // A subsequent get_project_vm must fail because the record is gone.
+        let err = supervisor.get_project_vm(dir.path(), "proj-destroy-1");
+        assert!(err.is_err(), "get after destroy should fail");
+    }
+
+    /// `destroy_project_vm` must refuse to destroy a Running VM.
+    #[test]
+    fn destroy_running_vm_returns_error() {
+        let dir = TempDir::new().unwrap();
+        provision(dir.path(), "proj-destroy-2");
+
+        let supervisor = ProjectVmSupervisor;
+
+        // Manually set the state to Running.
+        let mut record = supervisor
+            .get_project_vm(dir.path(), "proj-destroy-2")
+            .unwrap();
+        record.state = VmState::Running;
+        persist_record(dir.path(), &record).unwrap();
+
+        let result = supervisor.destroy_project_vm(dir.path(), "proj-destroy-2");
+        assert!(result.is_err(), "destroy of Running VM should fail");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Running"),
+            "error should mention Running state: {msg}"
+        );
+    }
+
+    /// When `stop_firecracker` is given a PID file and the process does not
+    /// exit within the timeout, force-kill via the PID file must be triggered
+    /// and the state must still become Stopped.
+    ///
+    /// This test spawns a real process (a shell sleep loop) and verifies that
+    /// the force-kill path works end-to-end without requiring KVM.
+    #[test]
+    fn stop_via_pid_file_force_kill() {
+
+        let dir = TempDir::new().unwrap();
+        let vm_dir_path = dir.path().join("vms").join("proj-force-kill");
+        fs::create_dir_all(vm_dir_path.join("logs")).unwrap();
+        fs::create_dir_all(vm_dir_path.join("artifacts")).unwrap();
+        fs::create_dir_all(vm_dir_path.join("cache")).unwrap();
+
+        // Spawn a real `sleep 60` process that will not exit on its own.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cannot spawn sleep");
+        let pid = child.id();
+
+        // Create a fake socket file to simulate a running Firecracker.
+        let sock_path = vm_dir_path.join("firecracker.sock");
+        fs::write(&sock_path, b"").unwrap();
+
+        // Write the PID file as boot_firecracker would.
+        let pid_path = vm_dir_path.join("firecracker.pid");
+        fs::write(&pid_path, pid.to_string()).unwrap();
+
+        // Build a minimal record pointing at these paths.
+        let now = now_rfc3339();
+        let mut record = ProjectVmRecord {
+            project_id: "proj-force-kill".to_string(),
+            vm_dir: vm_dir_path.clone(),
+            firecracker_sock: sock_path.clone(),
+            kernel_path: vm_dir_path.join("kernel"),
+            rootfs_path: vm_dir_path.join("rootfs.img"),
+            workspace_path: vm_dir_path.join("workspace.img"),
+            cache_dir: vm_dir_path.join("cache"),
+            logs_dir: vm_dir_path.join("logs"),
+            artifacts_dir: vm_dir_path.join("artifacts"),
+            state_path: vm_dir_path.join("state.json"),
+            state: VmState::Running,
+            kernel_ref: None,
+            seed_data_refs: vec![],
+            network_policy: NetworkPolicy::None,
+            secrets: vec![],
+            artifacts: vec![],
+            host_ebpf_policy: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        // Use a very short stop timeout (1 s) so the test doesn't hang.
+        let config = FirecrackerConfig {
+            stop_timeout_secs: 1,
+            ..test_config(PathBuf::from("/nonexistent/firecracker"))
+        };
+
+        // stop_firecracker sends SendCtrlAltDel (which will fail because there
+        // is no real socket), then polls for the socket to disappear. Because
+        // the socket is a plain file it won't disappear on its own, so after
+        // the 1 s timeout it must force-kill the process via the PID file.
+        stop_firecracker(&mut record, &config).expect("stop_firecracker should succeed");
+
+        // The state must be Stopped.
+        assert_eq!(record.state, VmState::Stopped);
+
+        // The socket file must be gone.
+        assert!(!sock_path.exists(), "socket file should be removed");
+
+        // The PID file must be gone.
+        assert!(!pid_path.exists(), "PID file should be removed");
+
+        // The child process must have been killed.
+        let outcome = child.try_wait().expect("try_wait failed");
+        assert!(
+            outcome.is_some(),
+            "process should have exited after force-kill"
+        );
+    }
+
+    /// Mock process state transitions are written correctly to the registry.
+    /// This uses a provisioned VM and manually drives state transitions without
+    /// spawning a real Firecracker binary, verifying each state is persisted.
+    #[test]
+    fn state_transitions_persisted_to_registry() {
+        let dir = TempDir::new().unwrap();
+        let supervisor = ProjectVmSupervisor;
+        provision(dir.path(), "proj-state-transitions");
+
+        // Verify initial Provisioned state.
+        let r = supervisor
+            .get_project_vm(dir.path(), "proj-state-transitions")
+            .unwrap();
+        assert_eq!(r.state, VmState::Provisioned);
+
+        // Manually set to Running and persist.
+        let mut r = r;
+        r.state = VmState::Running;
+        persist_record(dir.path(), &r).unwrap();
+
+        let r = supervisor
+            .get_project_vm(dir.path(), "proj-state-transitions")
+            .unwrap();
+        assert_eq!(r.state, VmState::Running);
+
+        // Transition to Stopped via stop_firecracker (no real socket, so it
+        // is a no-op on the API call and proceeds immediately to cleanup).
+        let config = test_config(PathBuf::from("/nonexistent/firecracker"));
+        let r = supervisor
+            .transition_vm_state_with_config(
+                dir.path(),
+                "proj-state-transitions",
+                VmState::Stopped,
+                &config,
+            )
+            .expect("stop should succeed");
+        assert_eq!(r.state, VmState::Stopped);
+
+        // Confirm the state is persisted.
+        let r = supervisor
+            .get_project_vm(dir.path(), "proj-state-transitions")
+            .unwrap();
+        assert_eq!(r.state, VmState::Stopped);
     }
 }
