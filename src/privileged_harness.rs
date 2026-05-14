@@ -88,12 +88,7 @@ pub fn kernel_has_overlay() -> bool {
 ///
 /// Returns the path to the merged directory, which callers should unmount with
 /// [`overlay_umount`] when done.
-pub fn overlay_mount(
-    lower: &Path,
-    upper: &Path,
-    work: &Path,
-    merged: &Path,
-) -> Result<()> {
+pub fn overlay_mount(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> Result<()> {
     fs::create_dir_all(upper).context("create upper dir")?;
     fs::create_dir_all(work).context("create work dir")?;
     fs::create_dir_all(merged).context("create merged dir")?;
@@ -105,7 +100,8 @@ pub fn overlay_mount(
         work.display(),
     );
     let source = CString::new("overlay").unwrap();
-    let target = CString::new(merged.to_str().unwrap_or("")).context("merged path has null byte")?;
+    let target =
+        CString::new(merged.to_str().unwrap_or("")).context("merged path has null byte")?;
     let fs_type = CString::new("overlay").unwrap();
     let data = CString::new(mount_data).context("mount data has null byte")?;
 
@@ -128,11 +124,16 @@ pub fn overlay_mount(
 
 /// Unmount the overlayfs at `merged` using `MNT_DETACH`.
 pub fn overlay_umount(merged: &Path) -> Result<()> {
-    let target = CString::new(merged.to_str().unwrap_or("")).context("merged path has null byte")?;
+    let target =
+        CString::new(merged.to_str().unwrap_or("")).context("merged path has null byte")?;
     let ret = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        bail!("umount2(MNT_DETACH) on '{}' failed: {}", merged.display(), err);
+        bail!(
+            "umount2(MNT_DETACH) on '{}' failed: {}",
+            merged.display(),
+            err
+        );
     }
     Ok(())
 }
@@ -189,7 +190,6 @@ const SYS_BPF: i64 = 321;
 const BPF_PROG_LOAD: c_uint = 5;
 // BPF_PROG_TYPE_SOCKET_FILTER.
 const BPF_PROG_TYPE_SOCKET_FILTER: c_uint = 1;
-
 
 /// Attempt to load a minimal BPF socket-filter program into the kernel.
 ///
@@ -346,7 +346,10 @@ mod tests {
 
         // Write a new file into the merged view — it goes to upper.
         fs::write(merged.join("upper_file.txt"), b"written to upper\n").unwrap();
-        assert!(upper.join("upper_file.txt").exists(), "write must appear in upper dir");
+        assert!(
+            upper.join("upper_file.txt").exists(),
+            "write must appear in upper dir"
+        );
 
         // Unmount.
         overlay_umount(&merged).expect("overlay_umount should succeed");
@@ -459,11 +462,16 @@ mod tests {
         // Either None (binary absent — skip) or Some(path) — both acceptable.
         match result {
             None => {
-                eprintln!("[info] Firecracker not found — locate_firecracker() correctly returns None");
+                eprintln!(
+                    "[info] Firecracker not found — locate_firecracker() correctly returns None"
+                );
             }
             Some(p) => {
                 eprintln!("[info] Firecracker found at {:?}", p);
-                assert!(p.exists(), "locate_firecracker returned a path that does not exist");
+                assert!(
+                    p.exists(),
+                    "locate_firecracker returned a path that does not exist"
+                );
             }
         }
     }
