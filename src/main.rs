@@ -20,6 +20,7 @@ pub mod host_control_plane;
 pub mod host_ebpf;
 pub mod mount_path;
 pub mod parity_check;
+pub mod privileged_harness;
 pub mod quota;
 pub mod registry;
 pub mod security_regression;
