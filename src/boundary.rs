@@ -165,7 +165,8 @@ mod tests {
 
     use crate::exec::GuestNetworkMode;
     use crate::host_control_plane::{
-        ArtifactRecord, HostEbpfPolicy, NetworkPolicy, ProjectVmSpec, SecretLease, VmState,
+        ArtifactRecord, HostEbpfPolicy, NetworkPolicy, ProjectVmSpec, SecretLease, VmBootError,
+        VmState,
     };
     use crate::registry::{ForkEntry, QuotaMode, Registry};
 
@@ -308,18 +309,39 @@ mod tests {
         assert!(record.rootfs_path.exists());
         assert!(record.workspace_path.exists());
 
-        let record = host
-            .supervisor()
-            .transition_vm_state(root.path(), "project-1", VmState::Running)
-            .unwrap();
-        assert_eq!(record.state, VmState::Running);
+        // transition_vm_state(Running) now drives a real Firecracker boot.
+        // On a development host without Firecracker installed, the call must
+        // return a structured VmBootError rather than silently writing state.
+        let boot_result =
+            host.supervisor()
+                .transition_vm_state(root.path(), "project-1", VmState::Running);
+        match boot_result {
+            Ok(record) => {
+                // Firecracker was available and booted successfully.
+                assert_eq!(record.state, VmState::Running);
+                host.supervisor()
+                    .transition_vm_state(root.path(), "project-1", VmState::Stopped)
+                    .expect("stopping a running VM should succeed");
+            }
+            Err(ref err) => {
+                // Firecracker binary is absent or KVM is unavailable — both are
+                // valid structured errors on CI hosts without Firecracker.
+                let boot_err = err.downcast_ref::<VmBootError>();
+                assert!(
+                    matches!(
+                        boot_err,
+                        Some(VmBootError::BinaryNotFound { .. })
+                            | Some(VmBootError::KvmUnavailable { .. })
+                    ),
+                    "expected BinaryNotFound or KvmUnavailable, got: {:?}",
+                    boot_err
+                );
+            }
+        }
 
-        let record = host
-            .supervisor()
-            .transition_vm_state(root.path(), "project-1", VmState::Stopped)
-            .unwrap();
-        assert_eq!(record.state, VmState::Stopped);
-
+        // Secret injection, artifact collection, and eBPF policy attachment do
+        // not require the VM to be in Running state — they operate on the
+        // on-disk record regardless of lifecycle state.
         let record = host
             .supervisor()
             .attach_network_policy(
@@ -382,7 +404,9 @@ mod tests {
             .supervisor()
             .get_project_vm(root.path(), "project-1")
             .unwrap();
-        assert_eq!(stored.state, VmState::Stopped);
+        // The VM may be Provisioned (no Firecracker on this host) or Stopped
+        // (if boot succeeded and was shut down). It must not be Running.
+        assert_ne!(stored.state, VmState::Running);
         assert_eq!(stored.secrets.len(), 1);
         assert_eq!(stored.artifacts.len(), 1);
         assert!(stored.host_ebpf_policy.is_some());

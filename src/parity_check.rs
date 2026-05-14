@@ -320,11 +320,28 @@ mod tests {
             .expect("provision_project_vm must succeed for parity check");
         assert_eq!(record.state, VmState::Provisioned);
 
-        let record = host
-            .supervisor()
-            .transition_vm_state(root.path(), "parity-project", VmState::Running)
-            .expect("transition_vm_state must succeed");
-        assert_eq!(record.state, VmState::Running);
+        // transition_vm_state(Running) now drives a real Firecracker boot.
+        // On CI hosts without Firecracker installed, the call returns a
+        // structured VmBootError. Both outcomes are valid for the parity check:
+        // the supervisor surface is present and the method is callable.
+        use crate::host_control_plane::VmBootError;
+        let boot_result =
+            host.supervisor()
+                .transition_vm_state(root.path(), "parity-project", VmState::Running);
+        match boot_result {
+            Ok(record) => assert_eq!(record.state, VmState::Running),
+            Err(ref err) => {
+                let boot_err = err.downcast_ref::<VmBootError>();
+                assert!(
+                    matches!(
+                        boot_err,
+                        Some(VmBootError::BinaryNotFound { .. })
+                            | Some(VmBootError::KvmUnavailable { .. })
+                    ),
+                    "expected BinaryNotFound or KvmUnavailable, got: {err}"
+                );
+            }
+        }
 
         let stored = host
             .supervisor()
