@@ -118,11 +118,18 @@ pub enum NetworkPolicy {
 }
 
 /// Short-lived secret lease metadata tracked by the host control plane.
+///
+/// `secret_value` holds the plaintext secret and is injected as an OCI
+/// environment variable at exec time. It is never persisted to the fork
+/// registry or any on-disk artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretLease {
     pub secret_name: String,
     pub scope: String,
     pub expires_at: String,
+    /// The plaintext secret value delivered to the container environment.
+    /// Not persisted to disk after injection.
+    pub secret_value: String,
 }
 
 /// Artifact metadata collected from a project VM.
@@ -1092,6 +1099,7 @@ mod tests {
                     secret_name: "DB_PASS".to_string(),
                     scope: "build".to_string(),
                     expires_at: "2026-01-01T00:00:00Z".to_string(),
+                    secret_value: "hunter2".to_string(),
                 },
             )
             .unwrap();
@@ -1103,6 +1111,7 @@ mod tests {
                     secret_name: "DB_PASS".to_string(),
                     scope: "deploy".to_string(),
                     expires_at: "2026-06-01T00:00:00Z".to_string(),
+                    secret_value: "hunter3".to_string(),
                 },
             )
             .unwrap();

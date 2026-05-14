@@ -258,6 +258,7 @@ mod tests {
             cpu: None,
             memory: None,
             network: GuestNetworkMode::None,
+            secret_leases: Vec::new(),
         };
         let exit_code = guest
             .run_exec("parity-fork", &["/bin/true".to_owned()], root.path(), &opts)

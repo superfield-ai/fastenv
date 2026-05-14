@@ -224,6 +224,7 @@ mod tests {
             cpu: None,
             memory: None,
             network: GuestNetworkMode::Host,
+            secret_leases: Vec::new(),
         };
 
         let exit_code = guest
@@ -366,6 +367,7 @@ mod tests {
                     secret_name: "npm-token".to_owned(),
                     scope: "project".to_owned(),
                     expires_at: "2026-01-01T00:00:00Z".to_owned(),
+                    secret_value: "npm_secret_token_value".to_owned(),
                 },
             )
             .unwrap();
@@ -458,6 +460,7 @@ mod tests {
                     cpu: None,
                     memory: None,
                     network,
+                    secret_leases: Vec::new(),
                 };
                 guest.run_exec(fork_id, &command, root_path.as_path(), &opts)
             }));

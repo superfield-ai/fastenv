@@ -188,6 +188,7 @@ fn main() -> Result<()> {
                 cpu: cpu_spec,
                 memory,
                 network,
+                secret_leases: Vec::new(),
             };
             let exit_code = guest.run_exec(&fork_id, &command, &cli.root, &opts)?;
             std::process::exit(exit_code);
