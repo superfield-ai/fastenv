@@ -645,7 +645,12 @@ fn boot_firecracker(record: &mut ProjectVmRecord, config: &FirecrackerConfig) ->
             .append(true)
             .open(&log_file)
             .map(|mut f| {
-                let _ = writeln!(f, "warning: cannot write PID file {}: {}", pid_path.display(), e);
+                let _ = writeln!(
+                    f,
+                    "warning: cannot write PID file {}: {}",
+                    pid_path.display(),
+                    e
+                );
             });
     }
 
@@ -1427,7 +1432,6 @@ exit 1
     /// the force-kill path works end-to-end without requiring KVM.
     #[test]
     fn stop_via_pid_file_force_kill() {
-
         let dir = TempDir::new().unwrap();
         let vm_dir_path = dir.path().join("vms").join("proj-force-kill");
         fs::create_dir_all(vm_dir_path.join("logs")).unwrap();
