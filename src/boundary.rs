@@ -163,6 +163,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    use crate::exec::GuestNetworkMode;
     use crate::host_control_plane::{
         ArtifactRecord, HostEbpfPolicy, NetworkPolicy, ProjectVmSpec, SecretLease, VmState,
     };
@@ -221,7 +222,7 @@ mod tests {
             crun_path: "/bin/true".to_owned(),
             cpu: None,
             memory: None,
-            network: Some("host".to_owned()),
+            network: GuestNetworkMode::Host,
         };
 
         let exit_code = guest
@@ -385,5 +386,61 @@ mod tests {
         assert_eq!(stored.secrets.len(), 1);
         assert_eq!(stored.artifacts.len(), 1);
         assert!(stored.host_ebpf_policy.is_some());
+    }
+
+    #[test]
+    fn guest_runtime_can_launch_multiple_containers() {
+        let host = LocalHostControlPlane::new();
+        let guest = *host.guest();
+        let root = TempDir::new().unwrap();
+        let root_path = root.path().to_path_buf();
+        let source_dir = root_path.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("hello.txt"), b"hello").unwrap();
+
+        guest
+            .build_base(&source_dir, "base-1", root_path.as_path())
+            .unwrap();
+
+        let registry = Registry::open(root_path.as_path()).unwrap();
+        for fork_id in ["fork-a", "fork-b"] {
+            registry
+                .insert_fork(
+                    fork_id,
+                    make_fork_entry(
+                        "base-1",
+                        root_path.join(format!("forks/{fork_id}/upper")),
+                        root_path.join(format!("forks/{fork_id}/work")),
+                        Some(root_path.join(format!("forks/{fork_id}/merged"))),
+                    ),
+                )
+                .unwrap();
+            fs::create_dir_all(root_path.join(format!("forks/{fork_id}/upper"))).unwrap();
+            fs::create_dir_all(root_path.join(format!("forks/{fork_id}/work"))).unwrap();
+            fs::create_dir_all(root_path.join(format!("forks/{fork_id}/merged"))).unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for (fork_id, network) in [
+            ("fork-a", GuestNetworkMode::None),
+            ("fork-b", GuestNetworkMode::AuditedEgress),
+        ] {
+            let guest = guest;
+            let root_path = root_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let command = vec!["/bin/true".to_owned()];
+                let opts = ExecOptions {
+                    crun_path: "/bin/true".to_owned(),
+                    cpu: None,
+                    memory: None,
+                    network,
+                };
+                guest.run_exec(fork_id, &command, root_path.as_path(), &opts)
+            }));
+        }
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), 0);
+        }
     }
 }
