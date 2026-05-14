@@ -149,6 +149,13 @@ enum Commands {
         /// Also measure exec start latency (runs exec /bin/true for each iteration).
         #[arg(long)]
         exec: bool,
+        /// Measure VM-tier latencies: Firecracker boot time, crun container
+        /// startup inside the VM, and eBPF overhead per layer.
+        /// Requires KVM access (/dev/kvm); VM tiers are skipped gracefully
+        /// when KVM is unavailable.
+        /// Also enabled by setting the environment variable FASTENV_BENCH_VM=1.
+        #[arg(long)]
+        vm: bool,
     },
 }
 
@@ -242,6 +249,7 @@ fn main() -> Result<()> {
             base,
             iterations,
             exec,
+            vm,
         } => {
             let result = guest.run_bench(
                 &base,
@@ -249,6 +257,7 @@ fn main() -> Result<()> {
                 &bench::BenchOptions {
                     iterations,
                     measure_exec: exec,
+                    measure_vm: vm,
                 },
             )?;
             let json = serde_json::to_string_pretty(&result).context("serialize bench result")?;
