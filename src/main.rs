@@ -19,6 +19,7 @@ pub mod host_control_plane;
 pub mod mount_path;
 pub mod quota;
 pub mod registry;
+pub mod security_regression;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
