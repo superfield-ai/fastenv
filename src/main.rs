@@ -11,6 +11,7 @@ pub mod build_base;
 pub mod diff;
 pub mod discard;
 pub mod du;
+pub mod e2e_smoke;
 pub mod exec;
 pub mod export_patch;
 pub mod fork;
