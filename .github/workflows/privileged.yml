@@ -1,0 +1,67 @@
+# Privileged integration test workflow for fastenv.
+#
+# Runs on every pull request that touches host-side modules requiring
+# CAP_SYS_ADMIN, KVM, or eBPF privileges:
+#   - src/host_control_plane.rs
+#   - src/boundary.rs
+#   - src/host_ebpf.rs
+#   - src/privileged_harness.rs
+#
+# The job targets a self-hosted runner with the `kvm` label, which provides:
+#   - /dev/kvm (for Firecracker boot smoke tests)
+#   - CAP_SYS_ADMIN (for overlayfs mount/unmount tests)
+#   - CAP_BPF or CAP_SYS_ADMIN (for host eBPF load tests)
+#
+# The privilege gate inside each test is the `FASTENV_PRIVILEGED_TESTS`
+# environment variable.  When the variable is absent the tests skip
+# gracefully; this CI job sets it so all three categories are exercised.
+name: Privileged integration tests
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "src/host_control_plane.rs"
+      - "src/boundary.rs"
+      - "src/host_ebpf.rs"
+      - "src/privileged_harness.rs"
+      - ".github/workflows/privileged.yml"
+
+jobs:
+  privileged-tests:
+    name: Privileged host harness (overlayfs, Firecracker, eBPF)
+    # Target a self-hosted runner with KVM access.
+    # The runner must be registered with the `kvm` label.
+    runs-on: [self-hosted, kvm]
+
+    env:
+      # Open the privilege gate so all three test categories run.
+      FASTENV_PRIVILEGED_TESTS: "1"
+      # Allow tests to locate the Firecracker binary if it is installed at a
+      # non-standard path on the runner.  Leave unset to use PATH resolution.
+      # FIRECRACKER_BIN: /opt/firecracker/firecracker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify KVM availability
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not present — runner is not KVM-enabled"
+            exit 1
+          fi
+          echo "/dev/kvm present: $(ls -la /dev/kvm)"
+
+      - name: Verify overlayfs kernel support
+        run: |
+          if grep -q overlay /proc/filesystems; then
+            echo "overlayfs supported by kernel"
+          else
+            echo "::warning::kernel does not advertise overlayfs — overlayfs tests will skip"
+          fi
+
+      - name: cargo test -- privileged_harness
+        run: cargo test privileged_harness 2>&1
