@@ -142,10 +142,10 @@ pub fn deprecated_commands() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::{GuestRuntime, HostControlPlane, LocalHostControlPlane};
-    use crate::exec::GuestNetworkMode;
-    use crate::gc::GcOptions;
-    use crate::host_control_plane::{NetworkPolicy, ProjectVmSpec};
+    use fastenv::boundary::{GuestRuntime, HostControlPlane, LocalHostControlPlane};
+    use fastenv::exec::GuestNetworkMode;
+    use fastenv::gc::GcOptions;
+    use fastenv::host_control_plane::{NetworkPolicy, ProjectVmSpec};
     use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
@@ -232,7 +232,7 @@ mod tests {
             .expect("build_base must be reachable through GuestRuntime");
 
         // fork
-        use crate::registry::{ForkEntry, QuotaMode, Registry};
+        use fastenv::registry::{ForkEntry, QuotaMode, Registry};
         use std::collections::HashMap;
         let registry = Registry::open(root.path()).unwrap();
         let fork_entry = ForkEntry {
@@ -253,7 +253,7 @@ mod tests {
         fs::create_dir_all(root.path().join("forks/parity-fork/merged")).unwrap();
 
         // exec
-        let opts = crate::exec::ExecOptions {
+        let opts = fastenv::exec::ExecOptions {
             crun_path: "/bin/true".to_owned(),
             cpu: None,
             memory: None,
@@ -303,7 +303,7 @@ mod tests {
     /// project VM record — this is the host-side parity requirement.
     #[test]
     fn host_control_plane_covers_project_vm_lifecycle() {
-        use crate::host_control_plane::VmState;
+        use fastenv::host_control_plane::VmState;
 
         let host = LocalHostControlPlane::new();
         let root = TempDir::new().unwrap();
@@ -325,7 +325,7 @@ mod tests {
         // On CI hosts without Firecracker installed, the call returns a
         // structured VmBootError. Both outcomes are valid for the parity check:
         // the supervisor surface is present and the method is callable.
-        use crate::host_control_plane::VmBootError;
+        use fastenv::host_control_plane::VmBootError;
         let boot_result =
             host.supervisor()
                 .transition_vm_state(root.path(), "parity-project", VmState::Running);
