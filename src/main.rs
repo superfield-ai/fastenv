@@ -5,29 +5,11 @@
 //   - docs/architecture.md
 //   - docs/implementation-plan.md
 
-pub mod bench;
-pub mod boundary;
-pub mod build_base;
-pub mod diff;
-pub mod discard;
-pub mod du;
-pub mod e2e_smoke;
-pub mod exec;
-pub mod export_patch;
-pub mod fork;
-pub mod gc;
-pub mod guest_ebpf;
-pub mod guest_harness;
-pub mod host_control_plane;
-pub mod host_ebpf;
-pub mod mount_path;
+// parity_check references crate::Cli so it must be declared in main.rs.
 pub mod parity_check;
-pub mod privileged_harness;
-pub mod quota;
-pub mod registry;
-pub mod security_regression;
 
 use anyhow::{Context, Result};
+use fastenv::{bench, boundary, exec, gc, quota};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 

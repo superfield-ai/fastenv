@@ -18,9 +18,7 @@
 //     duration_ms, network_mode.
 //  7. Bundle tmpdir is removed by RAII drop (success and error paths).
 
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{collections::BTreeMap, fmt};
 
@@ -29,6 +27,7 @@ use chrono::Utc;
 use clap::ValueEnum;
 use serde::Serialize;
 
+use crate::container_runtime::{ContainerRuntime, CrunBackend};
 use crate::guest_ebpf::{GuestAuditEvent, GuestEbpfLoader, GuestEbpfPolicy};
 use crate::host_control_plane::SecretLease;
 use crate::registry::{Registry, RegistryError};
@@ -228,34 +227,21 @@ pub fn run_exec(fork_id: &str, command: &[String], root: &Path, opts: &ExecOptio
     let ebpf_policy = GuestEbpfPolicy::for_container(fork_id);
     let ebpf_loader = GuestEbpfLoader::attach(&ebpf_policy);
 
-    // ── 4. Spawn crun subprocess ─────────────────────────────────────────────
-    // Inherit stdin/stdout/stderr from the parent process.
-    // Container ID = fork_id (must be unique per running container).
-    let mut child = Command::new(&opts.crun_path)
-        .arg("run")
-        .arg("--bundle")
-        .arg(bundle_dir.path())
-        .arg(fork_id)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "exec: failed to spawn crun ({}); is crun installed?",
-                opts.crun_path
-            )
-        })?;
+    // ── 4. Run container via CrunBackend (ContainerRuntime trait) ────────────
+    // All crun subprocess calls are encapsulated in CrunBackend::start.
+    // No direct Command::new("crun") calls are allowed outside container_runtime.rs.
+    let runtime: Box<dyn ContainerRuntime> = Box::new(CrunBackend::new(&opts.crun_path));
+    runtime
+        .create(fork_id, bundle_dir.path())
+        .context("exec: container create failed")?;
 
-    // ── 5. Wait for crun and propagate exit code ─────────────────────────────
-    let status = child.wait().context("exec: wait for crun process failed")?;
-
-    let exit_code = if let Some(code) = status.code() {
-        code
-    } else {
-        // Terminated by signal.
-        status.signal().unwrap_or(1) + 128
-    };
+    // ── 5. Start container and wait for exit code ────────────────────────────
+    let exit_code = runtime
+        .start(fork_id, bundle_dir.path())
+        .context("exec: container start failed")?;
+    runtime
+        .delete(fork_id)
+        .context("exec: container delete failed")?;
 
     let duration_ms = started_at.elapsed().as_millis();
 

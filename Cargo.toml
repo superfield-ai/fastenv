@@ -9,6 +9,28 @@ repository = "https://github.com/superfield-ai/fastenv"
 name = "fastenv"
 path = "src/main.rs"
 
+# Library target exposes modules for benchmarks and integration tests.
+[lib]
+name = "fastenv"
+path = "src/lib.rs"
+
+# Benchmark binaries — require criterion.
+# Run with: cargo bench --features youki
+[[bench]]
+name = "container_runtime"
+harness = false
+
+[[bench]]
+name = "e2e_runtime"
+harness = false
+
+[features]
+# Enable the experimental youki library backend for ContainerRuntime.
+# Activates YoukiBackend in src/container_runtime.rs and benchmark comparisons.
+# Usage: cargo build --features youki
+#        cargo bench --features youki
+youki = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -26,3 +48,6 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
