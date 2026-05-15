@@ -9,8 +9,8 @@
 pub mod parity_check;
 
 use anyhow::{Context, Result};
-use fastenv::{bench, boundary, exec, gc, quota};
 use clap::{Parser, Subcommand};
+use fastenv::{bench, boundary, exec, gc, quota};
 use std::path::PathBuf;
 
 use boundary::{GuestRuntime, HostControlPlane, LocalHostControlPlane};

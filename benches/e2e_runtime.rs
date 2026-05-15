@@ -71,7 +71,10 @@ impl E2eBenchResult {
         let artifact_path = artifact_dir.join("container-runtime-comparison.json");
 
         if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
-            eprintln!("e2e_runtime: failed to create {}: {e}", artifact_dir.display());
+            eprintln!(
+                "e2e_runtime: failed to create {}: {e}",
+                artifact_dir.display()
+            );
             return;
         }
 
@@ -149,12 +152,7 @@ fn run_io_workload(workload_dir: &std::path::Path, bytes: u64) -> Duration {
     started.elapsed()
 }
 
-fn run_e2e_bench(
-    c: &mut Criterion,
-    backend_name: &str,
-    n_containers: usize,
-    workload_bytes: u64,
-) {
+fn run_e2e_bench(c: &mut Criterion, backend_name: &str, n_containers: usize, workload_bytes: u64) {
     let mut group = c.benchmark_group("e2e");
     group.measurement_time(Duration::from_secs(60));
     group.sample_size(10);
