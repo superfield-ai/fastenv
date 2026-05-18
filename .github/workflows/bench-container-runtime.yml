@@ -1,0 +1,145 @@
+# On-demand Criterion benchmark workflow for the ContainerRuntime backends.
+#
+# Runs cargo bench for both the microbenchmark suite (per-op create/start/delete
+# latency) and the E2E suite (N=8 parallel containers, 64 MiB IO workload).
+#
+# Prerequisites installed at runtime:
+#   - crun (apt: crun)
+#   - busybox-static (rootfs stub at /tmp/fastenv-bench-rootfs)
+#
+# Outputs:
+#   - Criterion HTML report (target/criterion/) uploaded as artifact
+#   - docs/benchmarks/container-runtime-comparison.json uploaded as artifact
+#   - Job summary with raw Criterion output and JSON results
+#
+# Trigger: Actions → Bench: Container Runtime → Run workflow
+name: "Bench: Container Runtime"
+
+on:
+  workflow_dispatch:
+    inputs:
+      youki:
+        description: "Include YoukiBackend benchmarks (requires youki in PATH — skips gracefully if absent)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  bench:
+    name: Container Runtime Benchmarks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y crun busybox-static
+
+      - name: Set up minimal rootfs
+        run: |
+          ROOTFS=/tmp/fastenv-bench-rootfs
+          sudo mkdir -p "$ROOTFS"/{bin,etc,proc,dev,sys,tmp}
+          sudo cp /bin/busybox "$ROOTFS/bin/busybox"
+          sudo ln -sf busybox "$ROOTFS/bin/true"
+          sudo ln -sf busybox "$ROOTFS/bin/sh"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-bench-
+
+      # Build under the normal user so the cache stays warm for subsequent runs.
+      - name: Build benchmark binaries
+        run: |
+          cargo build --benches
+          ${{ inputs.youki }} && cargo build --benches --features youki || true
+
+      # crun needs CAP_SYS_ADMIN for pid/mount namespace creation.
+      # The CARGO_HOME/PATH pass-through ensures sudo uses the rustup toolchain.
+      - name: Run microbenchmarks — CrunBackend
+        run: |
+          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
+            cargo bench --bench container_runtime 2>&1 | tee microbench-crun.txt
+
+      - name: Run microbenchmarks — YoukiBackend
+        if: ${{ inputs.youki }}
+        run: |
+          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
+            cargo bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
+
+      # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
+      - name: Run E2E benchmarks — CrunBackend
+        run: |
+          cargo bench --bench e2e_runtime 2>&1 | tee e2e-crun.txt
+
+      - name: Run E2E benchmarks — YoukiBackend
+        if: ${{ inputs.youki }}
+        run: |
+          cargo bench --bench e2e_runtime --features youki 2>&1 | tee e2e-youki.txt
+
+      - name: Upload Criterion HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-${{ github.run_id }}
+          path: target/criterion/
+          retention-days: 90
+
+      - name: Upload JSON results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: docs/benchmarks/container-runtime-comparison.json
+          retention-days: 90
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Microbenchmarks (crun)"
+            echo '```'
+            cat microbench-crun.txt 2>/dev/null || echo "(skipped)"
+            echo '```'
+
+            if [ "${{ inputs.youki }}" = "true" ]; then
+              echo "## Microbenchmarks (youki)"
+              echo '```'
+              cat microbench-youki.txt 2>/dev/null || echo "(skipped)"
+              echo '```'
+            fi
+
+            echo "## E2E benchmarks"
+            echo '```'
+            cat e2e-crun.txt 2>/dev/null || echo "(skipped)"
+            echo '```'
+
+            if [ "${{ inputs.youki }}" = "true" ]; then
+              echo "## E2E benchmarks (youki)"
+              echo '```'
+              cat e2e-youki.txt 2>/dev/null || echo "(skipped)"
+              echo '```'
+            fi
+
+            echo "## JSON artifact"
+            echo '```json'
+            cat docs/benchmarks/container-runtime-comparison.json 2>/dev/null || echo "[]"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
