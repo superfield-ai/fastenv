@@ -71,7 +71,9 @@ impl MetricSummary {
         let pick = |q: f64| -> u64 {
             // Nearest-rank percentile on the sorted vector. Clamp the index to
             // the last element so q=1.0 maps to max.
-            let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            let idx = ((q * n as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(n - 1);
             ms[idx]
         };
         let min_ms = *ms.first().unwrap();
@@ -139,7 +141,10 @@ fn write_metric_to_artifact(
         let mut obj = serde_json::Map::new();
         obj.insert("backend".to_string(), serde_json::json!(backend));
         obj.insert(metric_key.to_string(), summary_value);
-        obj.insert("backend_verified".to_string(), serde_json::json!(backend_verified));
+        obj.insert(
+            "backend_verified".to_string(),
+            serde_json::json!(backend_verified),
+        );
         results.push(serde_json::Value::Object(obj));
     }
 
@@ -485,8 +490,7 @@ fn bench_youki_fork_time(c: &mut Criterion) {
                         total += elapsed;
                     }
                     Err(e) => {
-                        first_error
-                            .get_or_insert_with(|| format!("iter {i}: {e}"));
+                        first_error.get_or_insert_with(|| format!("iter {i}: {e}"));
                         // Abort iteration sampling — failing loud is the point.
                         break;
                     }
@@ -555,8 +559,7 @@ fn bench_youki_first_write(c: &mut Criterion) {
                         total += elapsed;
                     }
                     Err(e) => {
-                        first_error
-                            .get_or_insert_with(|| format!("iter {i}: {e}"));
+                        first_error.get_or_insert_with(|| format!("iter {i}: {e}"));
                         break;
                     }
                 }

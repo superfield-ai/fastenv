@@ -227,8 +227,7 @@ fn waitpid_exit_code(pid: i32) -> Result<i32> {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(anyhow::Error::from(err)
-                .context(format!("waitpid({pid}) failed")));
+            return Err(anyhow::Error::from(err).context(format!("waitpid({pid}) failed")));
         }
         // Translate the wait status with the same WIF* macros CrunBackend uses
         // through std::os::unix::process::ExitStatusExt.
