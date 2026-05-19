@@ -35,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y crun busybox-static
+          sudo apt-get install -y crun busybox-static libseccomp-dev
 
       - name: Set up minimal rootfs
         run: |
@@ -69,27 +69,40 @@ jobs:
       - name: Build benchmark binaries
         run: |
           cargo build --benches
-          ${{ inputs.youki }} && cargo build --benches --features youki || true
+          if [ "${{ inputs.youki }}" = "true" ]; then
+            cargo build --benches --features youki
+          fi
 
       # crun needs CAP_SYS_ADMIN for pid/mount namespace creation.
-      # Use the full cargo path: sudo does not inherit the rustup shim PATH.
+      # Preserve PATH, HOME, CARGO_HOME, and RUSTUP_HOME so that cargo and
+      # rustc (rustup shims) remain resolvable under the root environment.
       - name: Run microbenchmarks — CrunBackend
         run: |
-          sudo "$(which cargo)" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
+          set -o pipefail
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
 
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
+        timeout-minutes: 15
+        # YoukiBackend microbench runs real OCI namespace operations via libcontainer;
+        # allow failure so the E2E benches still run even if this step hangs or errors.
+        continue-on-error: true
         run: |
-          sudo "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
+          set -o pipefail
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
 
       # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
       - name: Run E2E benchmarks — CrunBackend
         run: |
+          set -o pipefail
           cargo bench --bench e2e_runtime 2>&1 | tee e2e-crun.txt
 
       - name: Run E2E benchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         run: |
+          set -o pipefail
           cargo bench --bench e2e_runtime --features youki 2>&1 | tee e2e-youki.txt
 
       - name: Upload Criterion HTML report
