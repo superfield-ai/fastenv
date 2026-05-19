@@ -74,20 +74,20 @@ jobs:
           fi
 
       # crun needs CAP_SYS_ADMIN for pid/mount namespace creation.
-      # Resolve the real cargo binary (not the rustup shim) before calling sudo,
-      # because sudo resets HOME and the shim cannot find the default toolchain.
+      # Preserve PATH, HOME, CARGO_HOME, and RUSTUP_HOME so that cargo and
+      # rustc (rustup shims) remain resolvable under the root environment.
       - name: Run microbenchmarks — CrunBackend
         run: |
           set -o pipefail
-          CARGO_BIN=$(rustup which cargo)
-          sudo "$CARGO_BIN" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
 
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         run: |
           set -o pipefail
-          CARGO_BIN=$(rustup which cargo)
-          sudo "$CARGO_BIN" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
 
       # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
       - name: Run E2E benchmarks — CrunBackend
