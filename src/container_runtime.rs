@@ -201,6 +201,49 @@ impl ContainerRuntime for CrunBackend {
 }
 
 // ---------------------------------------------------------------------------
+// waitpid helper (used by YoukiBackend)
+// ---------------------------------------------------------------------------
+
+/// Block on `waitpid(pid)` and translate the wait status into the same
+/// exit-code convention `CrunBackend::start` uses (normal: code; signal: 128+N).
+///
+/// `EINTR` is retried so a stray signal during the bench does not abort the wait.
+/// Used by `YoukiBackend::start` so both backends measure the same timed region
+/// (issue #124): wait for the container init process to actually exit before
+/// returning, instead of hard-coding `exit_code = 0`.
+#[cfg(feature = "youki")]
+fn waitpid_exit_code(pid: i32) -> Result<i32> {
+    use std::io;
+
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: libc::waitpid is async-signal-safe and takes a valid pointer.
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret == -1 {
+            let err = io::Error::last_os_error();
+            // Retry on EINTR; surface anything else (including ECHILD, which
+            // would indicate the init process is not our direct child — that
+            // breaks the issue #124 contract and must not be silently ignored).
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(anyhow::Error::from(err).context(format!("waitpid({pid}) failed")));
+        }
+        // Translate the wait status with the same WIF* macros CrunBackend uses
+        // through std::os::unix::process::ExitStatusExt.
+        if libc::WIFEXITED(status) {
+            return Ok(libc::WEXITSTATUS(status));
+        }
+        if libc::WIFSIGNALED(status) {
+            return Ok(libc::WTERMSIG(status) + 128);
+        }
+        // Stopped/continued events shouldn't appear without WUNTRACED/WCONTINUED.
+        // If we somehow see one, keep waiting for the terminating event.
+        continue;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // YoukiBackend (feature-gated)
 // ---------------------------------------------------------------------------
 
@@ -330,10 +373,27 @@ impl ContainerRuntime for YoukiBackend {
         Ok(())
     }
 
-    /// Start the container using the libcontainer crate in-process.
+    /// Start the container using the libcontainer crate in-process, then block
+    /// until the container init process exits and return its real exit code.
     ///
-    /// Loads the container state created by `create()` and calls
-    /// `Container::start()`. Returns the exit code of the container process.
+    /// Loads the container state created by `create()`, calls
+    /// `Container::start()` (which notifies the waiting init to exec the
+    /// workload), then `waitpid(2)`s on the init pid to recover the workload's
+    /// exit status. This makes YoukiBackend::start measure the same work as
+    /// CrunBackend::start (which already blocks via `child.wait()`), so the
+    /// crun-vs-youki benchmark compares equivalent timed regions (issue #124).
+    ///
+    /// The init process is a direct child of the calling process because
+    /// libcontainer forks it from the intermediate process with `CLONE_PARENT`
+    /// (see `libcontainer::process::fork::container_clone_sibling`). That makes
+    /// `waitpid(init_pid)` a valid call from this thread; if a future
+    /// libcontainer release changes the parent model, this code returns an
+    /// explicit error rather than silently reporting `0`.
+    ///
+    /// Exit-code semantics match `CrunBackend::start`:
+    ///   - normal exit:        process exit code
+    ///   - killed by signal N: 128 + N
+    ///
     /// No youki binary is required.
     fn start(&self, fork_id: &str, _bundle_dir: &Path) -> Result<i32> {
         use libcontainer::container::Container;
@@ -350,7 +410,19 @@ impl ContainerRuntime for YoukiBackend {
             )
         })?;
 
-        // Start the container in-process via libcontainer.
+        // Capture the init pid before notifying start so we can waitpid on it.
+        // libcontainer recorded this in the container state during build().
+        let init_pid = container.pid().ok_or_else(|| {
+            anyhow::anyhow!(
+                "container_runtime(youki): container '{}' has no init pid recorded; \
+                 create() must run before start()",
+                fork_id
+            )
+        })?;
+
+        // Start the container in-process via libcontainer. This only sends the
+        // start signal over the notify socket; the init process exec's the
+        // workload and we still have to wait for it to exit below.
         container.start().with_context(|| {
             format!(
                 "container_runtime(youki): libcontainer start failed for fork '{}'",
@@ -358,11 +430,16 @@ impl ContainerRuntime for YoukiBackend {
             )
         })?;
 
-        // libcontainer::container::Container::start() does not directly return
-        // the container process exit code. The container process exit code is
-        // available after the container process exits. For the benchmark
-        // comparison, we report 0 on success (the container ran to completion).
-        let exit_code = 0i32;
+        // Block until the container init process exits, then translate the
+        // wait status to the same exit-code convention CrunBackend uses.
+        // libc::waitpid is used directly to avoid pulling in a new dep.
+        let exit_code = waitpid_exit_code(init_pid.as_raw()).with_context(|| {
+            format!(
+                "container_runtime(youki): waitpid on init pid {} for fork '{}' failed",
+                init_pid.as_raw(),
+                fork_id
+            )
+        })?;
 
         let duration_ms = started.elapsed().as_millis();
         tracing::info!(
@@ -574,6 +651,66 @@ mod tests {
                 "error should mention config.json: {}",
                 err
             );
+        }
+
+        /// YoukiBackend integration test: a workload exiting with code 7
+        /// surfaces as `exit_code = 7` from `YoukiBackend::start` (issue #124
+        /// acceptance criterion: real container init exit code, not 0).
+        ///
+        /// Requires: CAP_SYS_ADMIN, a minimal rootfs at /tmp/fastenv-test-rootfs.
+        /// No youki binary in PATH is required — libcontainer runs in-process.
+        /// Skipped in CI.
+        #[test]
+        #[ignore = "requires CAP_SYS_ADMIN + test rootfs; run inside project VM"]
+        fn youki_start_surfaces_real_exit_code_seven() {
+            let bundle_tmp = tempfile::TempDir::new().unwrap();
+            let state_tmp = tempfile::TempDir::new().unwrap();
+            let rootfs = std::path::PathBuf::from("/tmp/fastenv-test-rootfs");
+            if !rootfs.exists() {
+                eprintln!("SKIP: /tmp/fastenv-test-rootfs not found");
+                return;
+            }
+            // Workload: `sh -c 'exit 7'` — exit code 7 must propagate through
+            // waitpid back to YoukiBackend::start (not the hard-coded 0).
+            let config = serde_json::json!({
+                "ociVersion": "1.0.0",
+                "process": {
+                    "terminal": false,
+                    "user": {"uid": 0, "gid": 0},
+                    "args": ["/bin/sh", "-c", "exit 7"],
+                    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                    "cwd": "/"
+                },
+                "root": {"path": rootfs.to_str().unwrap(), "readonly": false},
+                "mounts": [
+                    {"destination": "/proc", "type": "proc", "source": "proc"},
+                    {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+                     "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+                    {"destination": "/sys", "type": "sysfs", "source": "sysfs",
+                     "options": ["nosuid", "noexec", "nodev", "ro"]}
+                ],
+                "linux": {
+                    "namespaces": [
+                        {"type": "pid"},
+                        {"type": "mount"}
+                    ]
+                }
+            });
+            std::fs::write(
+                bundle_tmp.path().join("config.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .unwrap();
+
+            let backend = YoukiBackend::new(state_tmp.path());
+            let fork_id = format!("youki-exit7-{}", std::process::id());
+            backend.create(&fork_id, bundle_tmp.path()).unwrap();
+            let exit_code = backend.start(&fork_id, bundle_tmp.path()).unwrap();
+            assert_eq!(
+                exit_code, 7,
+                "YoukiBackend::start must return real container init exit code (7), not 0"
+            );
+            backend.delete(&fork_id).unwrap();
         }
 
         /// YoukiBackend integration test: create/start/delete lifecycle inside VM.

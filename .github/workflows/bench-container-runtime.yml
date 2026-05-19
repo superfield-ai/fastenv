@@ -28,7 +28,11 @@ on:
 jobs:
   bench:
     name: Container Runtime Benchmarks
-    runs-on: ubuntu-latest
+    # Issue #124: the default GitHub-hosted shared 2-vCPU runner is too noisy to publish
+    # crun-vs-youki percentile comparisons from. Use the org's dedicated bench
+    # runner (the same label bench.yml already targets) so the timed regions
+    # are not contaminated by neighbour-tenant scheduling jitter.
+    runs-on: [self-hosted, Linux, X64]
 
     steps:
       - uses: actions/checkout@v4
@@ -86,9 +90,10 @@ jobs:
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         timeout-minutes: 15
-        # YoukiBackend microbench runs real OCI namespace operations via libcontainer;
-        # allow failure so the E2E benches still run even if this step hangs or errors.
-        continue-on-error: true
+        # Issue #124: this step intentionally fails the workflow on any
+        # iteration error. A partial youki failure must NOT be swallowed —
+        # silently dropped samples would produce a fake youki win in the
+        # published JSON artifact. Microbench step.
         run: |
           set -o pipefail
           sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
@@ -104,9 +109,10 @@ jobs:
       - name: Run fork_latency benchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         timeout-minutes: 15
-        # YoukiBackend runs real OCI namespace operations via libcontainer;
-        # allow failure so the rest of the workflow still completes if this hangs.
-        continue-on-error: true
+        # Issue #124: this step intentionally fails the workflow on any
+        # iteration error. Any youki iteration failure must fail the workflow
+        # so we never publish a JSON artifact that looks like a youki win
+        # because youki silently dropped samples. fork_latency step.
         run: |
           set -o pipefail
           sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \

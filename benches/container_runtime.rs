@@ -1,18 +1,45 @@
-// benches/container_runtime.rs — Microbenchmark suite for ContainerRuntime backends.
+// benches/container_runtime.rs — Per-op container runtime microbenchmarks.
 //
 // Canonical docs:
 //   - docs/prd.md §5 (Guest Runtime)
 //   - docs/architecture.md §Container Lifecycle
+//   - docs/benchmarks/README.md (JSON artifact schema)
 //   - Issue #113: ContainerRuntime trait and youki backend
+//   - Issue #124: Make crun-vs-youki benchmark signal trustworthy
 //
-// Measures per-operation latency (create/start/delete) for each backend.
-// Results: p50/p95/p99 latency reported by criterion.
+// SCOPE — issue #124
+// ------------------
+// The previous incarnation of this file compared `crun/create`, `crun/delete`,
+// `youki/create`, `youki/delete` head-to-head as if they measured equivalent
+// work. They did not:
+//
+//   * `CrunBackend::create`   = "validate config.json exists" (essentially free)
+//   * `YoukiBackend::create`  = full `libcontainer::ContainerBuilder::build()`,
+//                                which forks an intermediate process and sets up
+//                                namespaces.
+//   * `CrunBackend::delete`   = no-op (the `crun run` invocation in `start`
+//                                handles its own cleanup; this method only
+//                                emits a tracing span).
+//   * `YoukiBackend::delete`  = real `libcontainer::Container::delete(false)`.
+//
+// Publishing those side-by-side made it look like "youki is much slower at
+// create/delete than crun", but the timed regions were structurally different
+// — crun's work for create/delete simply lives elsewhere in its lifecycle.
+//
+// The only operation that times *equivalent work* across both backends is the
+// full create+start+delete round-trip, and that is already covered by
+// `benches/fork_latency.rs` (`fork_time` / `first_write`). To avoid republishing
+// a misleading comparison, the per-op `create` and `delete` benchmarks have
+// been removed from this file (issue #124 acceptance criterion). The per-op
+// `start` benchmarks are kept because both backends do equivalent work there:
+// each blocks until the container init process exits and returns its real
+// exit code (see `YoukiBackend::start` in `src/container_runtime.rs`).
 //
 // Usage:
-//   cargo bench                        # CrunBackend only
-//   cargo bench --features youki       # CrunBackend + YoukiBackend
+//   cargo bench --bench container_runtime                  # CrunBackend only
+//   cargo bench --bench container_runtime --features youki # + YoukiBackend
 //
-// NOTE: These benchmarks invoke real OCI runtime binaries and require:
+// Prerequisites:
 //   - crun installed at /usr/bin/crun (for CrunBackend)
 //   - CAP_SYS_ADMIN (for namespace operations) — for YoukiBackend (libcontainer)
 //   - A minimal rootfs at /tmp/fastenv-bench-rootfs
@@ -67,32 +94,8 @@ fn prerequisites_available() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// CrunBackend microbenchmarks
+// CrunBackend microbenchmarks — only `start` (the comparable op).
 // ---------------------------------------------------------------------------
-
-fn bench_crun_create(c: &mut Criterion) {
-    if !prerequisites_available() {
-        eprintln!(
-            "SKIP bench_crun_create: prerequisites not met \
-             (need /usr/bin/crun and /tmp/fastenv-bench-rootfs)"
-        );
-        return;
-    }
-
-    let rootfs = PathBuf::from("/tmp/fastenv-bench-rootfs");
-    let mut group = c.benchmark_group("crun/create");
-    group.measurement_time(Duration::from_secs(10));
-
-    group.bench_function(BenchmarkId::new("create", "crun"), |b| {
-        b.iter(|| {
-            let tmp = tempfile::TempDir::new().unwrap();
-            write_bench_config(tmp.path(), &rootfs);
-            let backend = CrunBackend::default();
-            backend.create("bench-fork", tmp.path()).unwrap();
-        });
-    });
-    group.finish();
-}
 
 fn bench_crun_start(c: &mut Criterion) {
     if !prerequisites_available() {
@@ -123,51 +126,9 @@ fn bench_crun_start(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_crun_delete(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crun/delete");
-    group.measurement_time(Duration::from_secs(5));
-
-    // CrunBackend delete is a no-op, so this measures the tracing overhead.
-    group.bench_function(BenchmarkId::new("delete", "crun"), |b| {
-        b.iter(|| {
-            let backend = CrunBackend::default();
-            backend.delete("bench-fork").unwrap();
-        });
-    });
-    group.finish();
-}
-
 // ---------------------------------------------------------------------------
-// YoukiBackend microbenchmarks (feature-gated)
+// YoukiBackend microbenchmarks (feature-gated) — only `start`.
 // ---------------------------------------------------------------------------
-
-#[cfg(feature = "youki")]
-fn bench_youki_create(c: &mut Criterion) {
-    use fastenv::container_runtime::YoukiBackend;
-
-    if !prerequisites_available() {
-        eprintln!(
-            "SKIP bench_youki_create: prerequisites not met \
-             (need CAP_SYS_ADMIN and /tmp/fastenv-bench-rootfs; no youki binary required)"
-        );
-        return;
-    }
-
-    let rootfs = PathBuf::from("/tmp/fastenv-bench-rootfs");
-    let mut group = c.benchmark_group("youki/create");
-    group.measurement_time(Duration::from_secs(10));
-
-    group.bench_function(BenchmarkId::new("create", "youki"), |b| {
-        b.iter(|| {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let state_tmp = tempfile::TempDir::new().unwrap();
-            write_bench_config(tmp.path(), &rootfs);
-            let backend = YoukiBackend::new(state_tmp.path());
-            backend.create("bench-fork", tmp.path()).unwrap();
-        });
-    });
-    group.finish();
-}
 
 #[cfg(feature = "youki")]
 fn bench_youki_start(c: &mut Criterion) {
@@ -201,46 +162,14 @@ fn bench_youki_start(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "youki")]
-fn bench_youki_delete(c: &mut Criterion) {
-    use fastenv::container_runtime::YoukiBackend;
-
-    let mut group = c.benchmark_group("youki/delete");
-    group.measurement_time(Duration::from_secs(5));
-
-    // YoukiBackend delete uses libcontainer in-process — no youki binary needed.
-    // Deleting a non-existent container is best-effort and does not return an error.
-    group.bench_function(BenchmarkId::new("delete", "youki"), |b| {
-        b.iter(|| {
-            let state_tmp = tempfile::TempDir::new().unwrap();
-            let backend = YoukiBackend::new(state_tmp.path());
-            let _ = backend.delete("bench-fork-nonexistent");
-        });
-    });
-    group.finish();
-}
-
 // ---------------------------------------------------------------------------
 // Criterion registration
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "youki"))]
-criterion_group!(
-    benches,
-    bench_crun_create,
-    bench_crun_start,
-    bench_crun_delete,
-);
+criterion_group!(benches, bench_crun_start);
 
 #[cfg(feature = "youki")]
-criterion_group!(
-    benches,
-    bench_crun_create,
-    bench_crun_start,
-    bench_crun_delete,
-    bench_youki_create,
-    bench_youki_start,
-    bench_youki_delete,
-);
+criterion_group!(benches, bench_crun_start, bench_youki_start);
 
 criterion_main!(benches);
