@@ -3,7 +3,9 @@
 // Canonical docs:
 //   - docs/prd.md §5 (Guest Runtime)
 //   - docs/architecture.md §Container Lifecycle
+//   - docs/benchmarks/README.md (JSON artifact schema)
 //   - Issue #121: Rewrite container-runtime benchmarks to measure real fork latency
+//   - Issue #124: Make crun-vs-youki benchmark signal trustworthy
 //
 // Measures real container lifecycle latency for each backend:
 //   1. fork_time:    Wall time from backend.create() to backend.start() return.
@@ -14,7 +16,10 @@
 //                   Measures time-to-usable from the host's perspective.
 //
 // After each sample, backend identity is verified by scanning /proc/*/cmdline.
-// Results are written to docs/benchmarks/container-runtime-comparison.json.
+// Per-sample durations are aggregated and written as p50/p95/p99/min/max/stddev
+// to docs/benchmarks/container-runtime-comparison.json (issue #124 — single
+// per-backend single-last-sample fields (the old last_* keys) have been removed because
+// any single outlier would otherwise define the published number).
 //
 // Usage:
 //   cargo bench --bench fork_latency                    # CrunBackend only
@@ -35,68 +40,119 @@ use std::time::{Duration, Instant};
 // Result schema — written to docs/benchmarks/container-runtime-comparison.json
 // ---------------------------------------------------------------------------
 
-/// Machine-readable benchmark result per backend run.
+/// Per-metric percentile summary (issue #124).
 ///
-/// Written to docs/benchmarks/container-runtime-comparison.json after the
-/// benchmark run so CI and post-analysis tooling can compare backends.
+/// All times are in milliseconds. The published JSON artifact carries one of
+/// these per (backend, metric) pair (e.g. crun/fork_time, youki/first_write),
+/// so consumers can defensibly compare backends at p95 from a single CI run.
 #[derive(Debug, Serialize)]
-struct ForkLatencyResult {
-    /// Backend identifier: "crun" or "youki".
-    backend: String,
-    /// Wall time from backend.create() to backend.start() return, in milliseconds.
-    fork_time_ms: u64,
-    /// Time from backend.start() call until sentinel file appears, in milliseconds.
-    first_write_ms: u64,
-    /// True if backend identity was confirmed via /proc/*/cmdline scanning.
-    backend_verified: bool,
+struct MetricSummary {
+    /// Number of successful samples that contributed to the percentiles.
+    n: usize,
+    p50_ms: u64,
+    p95_ms: u64,
+    p99_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+    stddev_ms: u64,
 }
 
-impl ForkLatencyResult {
-    /// Write this result to docs/benchmarks/container-runtime-comparison.json.
-    ///
-    /// If the file already exists, the new result replaces any entry for the
-    /// same backend. Creates the docs/benchmarks/ directory if it does not exist.
-    fn write_to_artifact(&self) {
-        let artifact_dir = PathBuf::from("docs/benchmarks");
-        let artifact_path = artifact_dir.join("container-runtime-comparison.json");
-
-        if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
-            eprintln!(
-                "fork_latency: failed to create {}: {e}",
-                artifact_dir.display()
-            );
-            return;
+impl MetricSummary {
+    /// Build a summary from a vector of per-iteration durations. Returns `None`
+    /// if no successful samples were collected (so the artifact does not carry
+    /// fabricated zero values — see issue #124's "fail loud" requirement).
+    fn from_samples(samples: &[Duration]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
         }
-
-        // Load existing results array if present.
-        let mut results: Vec<serde_json::Value> = if artifact_path.exists() {
-            match std::fs::read_to_string(&artifact_path) {
-                Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-                Err(_) => vec![],
-            }
-        } else {
-            vec![]
+        let mut ms: Vec<u64> = samples.iter().map(|d| d.as_millis() as u64).collect();
+        ms.sort_unstable();
+        let n = ms.len();
+        let pick = |q: f64| -> u64 {
+            // Nearest-rank percentile on the sorted vector. Clamp the index to
+            // the last element so q=1.0 maps to max.
+            let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            ms[idx]
         };
+        let min_ms = *ms.first().unwrap();
+        let max_ms = *ms.last().unwrap();
+        let mean = ms.iter().sum::<u64>() as f64 / n as f64;
+        let var = ms
+            .iter()
+            .map(|&v| {
+                let d = v as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
+        let stddev_ms = var.sqrt() as u64;
+        Some(MetricSummary {
+            n,
+            p50_ms: pick(0.50),
+            p95_ms: pick(0.95),
+            p99_ms: pick(0.99),
+            min_ms,
+            max_ms,
+            stddev_ms,
+        })
+    }
+}
 
-        // Remove any existing entry for this backend.
-        results.retain(|v| v.get("backend").and_then(|b| b.as_str()) != Some(&self.backend));
+/// Update the artifact JSON for a given (backend, metric) pair. Existing keys
+/// for other metrics on the same backend (and other backends entirely) are
+/// preserved so successive benchmark functions can merge into one file.
+fn write_metric_to_artifact(
+    backend: &str,
+    metric_key: &str,
+    summary: &MetricSummary,
+    backend_verified: bool,
+) {
+    let artifact_dir = PathBuf::from("docs/benchmarks");
+    let artifact_path = artifact_dir.join("container-runtime-comparison.json");
 
-        // Append this run.
-        if let Ok(v) = serde_json::to_value(self) {
-            results.push(v);
+    if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
+        eprintln!(
+            "fork_latency: failed to create {}: {e}",
+            artifact_dir.display()
+        );
+        return;
+    }
+
+    let mut results: Vec<serde_json::Value> = if artifact_path.exists() {
+        match std::fs::read_to_string(&artifact_path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => vec![],
         }
+    } else {
+        vec![]
+    };
 
-        match serde_json::to_string_pretty(&results) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&artifact_path, json) {
-                    eprintln!(
-                        "fork_latency: failed to write {}: {e}",
-                        artifact_path.display()
-                    );
-                }
+    let summary_value = serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
+
+    if let Some(entry) = results
+        .iter_mut()
+        .find(|v| v.get("backend").and_then(|b| b.as_str()) == Some(backend))
+    {
+        entry[metric_key] = summary_value;
+        entry["backend_verified"] = serde_json::json!(backend_verified);
+    } else {
+        let mut obj = serde_json::Map::new();
+        obj.insert("backend".to_string(), serde_json::json!(backend));
+        obj.insert(metric_key.to_string(), summary_value);
+        obj.insert("backend_verified".to_string(), serde_json::json!(backend_verified));
+        results.push(serde_json::Value::Object(obj));
+    }
+
+    match serde_json::to_string_pretty(&results) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&artifact_path, json) {
+                eprintln!(
+                    "fork_latency: failed to write {}: {e}",
+                    artifact_path.display()
+                );
             }
-            Err(e) => eprintln!("fork_latency: failed to serialise results: {e}"),
         }
+        Err(e) => eprintln!("fork_latency: failed to serialise results: {e}"),
     }
 }
 
@@ -262,9 +318,12 @@ fn measure_first_write<R: ContainerRuntime>(
     // start() blocks until the container process exits; sentinel should exist after.
     let _exit = backend.start(fork_id, bundle_dir)?;
     // Poll until the sentinel file appears (should be immediate after start() returns).
+    // Issue #124: sleep-based poll, not busy-wait. A tight busy-wait here would
+    // steal a CPU from the container being timed and contaminate the
+    // first_write measurement.
     let deadline = t0 + Duration::from_secs(5);
     while !sentinel_path.exists() && Instant::now() < deadline {
-        std::hint::spin_loop();
+        std::thread::sleep(Duration::from_micros(50));
     }
     let elapsed = t0.elapsed();
     let verified = verify_fn();
@@ -290,8 +349,10 @@ fn bench_crun_fork_time(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(30));
 
+    // Per-iteration durations across all criterion samples — feeds the
+    // percentile summary written to the JSON artifact (issue #124).
+    let mut all_samples: Vec<Duration> = Vec::new();
     let mut last_verified = false;
-    let mut last_fork_ms: u64 = 0;
 
     group.bench_function("fork_time", |b| {
         b.iter_custom(|iters| {
@@ -304,7 +365,7 @@ fn bench_crun_fork_time(c: &mut Criterion) {
                 match measure_fork_time(&backend, &fork_id, tmp.path(), verify_crun_backend) {
                     Ok((elapsed, verified)) => {
                         last_verified = verified;
-                        last_fork_ms = elapsed.as_millis() as u64;
+                        all_samples.push(elapsed);
                         total += elapsed;
                     }
                     Err(e) => eprintln!("WARN bench_crun_fork_time iter {i}: {e}"),
@@ -315,15 +376,11 @@ fn bench_crun_fork_time(c: &mut Criterion) {
     });
     group.finish();
 
-    // Write result artifact after the benchmark group completes.
-    // Use a separate measurement for the artifact (last sample values).
-    ForkLatencyResult {
-        backend: "crun".to_string(),
-        fork_time_ms: last_fork_ms,
-        first_write_ms: 0, // filled in by bench_crun_first_write
-        backend_verified: last_verified,
+    if let Some(summary) = MetricSummary::from_samples(&all_samples) {
+        write_metric_to_artifact("crun", "fork_time", &summary, last_verified);
+    } else {
+        eprintln!("bench_crun_fork_time: no successful samples; artifact not updated");
     }
-    .write_to_artifact();
 }
 
 // ---------------------------------------------------------------------------
@@ -344,8 +401,8 @@ fn bench_crun_first_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(60));
 
+    let mut all_samples: Vec<Duration> = Vec::new();
     let mut last_verified = false;
-    let mut last_fw_ms: u64 = 0;
 
     group.bench_function("first_write", |b| {
         b.iter_custom(|iters| {
@@ -366,7 +423,7 @@ fn bench_crun_first_write(c: &mut Criterion) {
                 ) {
                     Ok((elapsed, verified)) => {
                         last_verified = verified;
-                        last_fw_ms = elapsed.as_millis() as u64;
+                        all_samples.push(elapsed);
                         total += elapsed;
                     }
                     Err(e) => eprintln!("WARN bench_crun_first_write iter {i}: {e}"),
@@ -377,59 +434,10 @@ fn bench_crun_first_write(c: &mut Criterion) {
     });
     group.finish();
 
-    // Update artifact with first_write data, merging with any existing crun entry.
-    update_artifact_first_write("crun", last_fw_ms, last_verified);
-}
-
-/// Update the artifact JSON: set first_write_ms (and backend_verified) for the
-/// named backend, preserving fork_time_ms from any prior write.
-fn update_artifact_first_write(backend: &str, first_write_ms: u64, backend_verified: bool) {
-    let artifact_dir = PathBuf::from("docs/benchmarks");
-    let artifact_path = artifact_dir.join("container-runtime-comparison.json");
-
-    if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
-        eprintln!(
-            "fork_latency: failed to create {}: {e}",
-            artifact_dir.display()
-        );
-        return;
-    }
-
-    let mut results: Vec<serde_json::Value> = if artifact_path.exists() {
-        match std::fs::read_to_string(&artifact_path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => vec![],
-        }
+    if let Some(summary) = MetricSummary::from_samples(&all_samples) {
+        write_metric_to_artifact("crun", "first_write", &summary, last_verified);
     } else {
-        vec![]
-    };
-
-    // Find the entry for this backend and update it, or create a new one.
-    if let Some(entry) = results
-        .iter_mut()
-        .find(|v| v.get("backend").and_then(|b| b.as_str()) == Some(backend))
-    {
-        entry["first_write_ms"] = serde_json::json!(first_write_ms);
-        entry["backend_verified"] = serde_json::json!(backend_verified);
-    } else {
-        results.push(serde_json::json!({
-            "backend": backend,
-            "fork_time_ms": 0,
-            "first_write_ms": first_write_ms,
-            "backend_verified": backend_verified,
-        }));
-    }
-
-    match serde_json::to_string_pretty(&results) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&artifact_path, json) {
-                eprintln!(
-                    "fork_latency: failed to write {}: {e}",
-                    artifact_path.display()
-                );
-            }
-        }
-        Err(e) => eprintln!("fork_latency: failed to serialise results: {e}"),
+        eprintln!("bench_crun_first_write: no successful samples; artifact not updated");
     }
 }
 
@@ -454,21 +462,17 @@ fn bench_youki_fork_time(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(30));
 
+    let mut all_samples: Vec<Duration> = Vec::new();
     let mut last_verified = false;
-    let mut last_fork_ms: u64 = 0;
-
-    // Track whether the backend is functional in this environment.
-    let mut backend_available = true;
+    // Issue #124: do NOT short-circuit failed iterations with a zero-duration
+    // accumulator — that quietly drags the mean down and lets a partial youki
+    // failure look like a youki win. Instead, panic so the workflow fails.
+    let mut first_error: Option<String> = None;
 
     group.bench_function("fork_time", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for i in 0..iters {
-                if !backend_available {
-                    // Backend failed on a prior iteration; skip remaining samples.
-                    total += Duration::from_millis(0);
-                    continue;
-                }
                 let tmp = tempfile::TempDir::new().unwrap();
                 let state_tmp = tempfile::TempDir::new().unwrap();
                 write_bench_config(tmp.path(), &rootfs);
@@ -477,12 +481,14 @@ fn bench_youki_fork_time(c: &mut Criterion) {
                 match measure_fork_time(&backend, &fork_id, tmp.path(), verify_youki_backend) {
                     Ok((elapsed, verified)) => {
                         last_verified = verified;
-                        last_fork_ms = elapsed.as_millis() as u64;
+                        all_samples.push(elapsed);
                         total += elapsed;
                     }
                     Err(e) => {
-                        eprintln!("SKIP bench_youki_fork_time: backend error at iter {i}: {e}");
-                        backend_available = false;
+                        first_error
+                            .get_or_insert_with(|| format!("iter {i}: {e}"));
+                        // Abort iteration sampling — failing loud is the point.
+                        break;
                     }
                 }
             }
@@ -491,14 +497,16 @@ fn bench_youki_fork_time(c: &mut Criterion) {
     });
     group.finish();
 
-    if last_fork_ms > 0 {
-        ForkLatencyResult {
-            backend: "youki".to_string(),
-            fork_time_ms: last_fork_ms,
-            first_write_ms: 0,
-            backend_verified: last_verified,
-        }
-        .write_to_artifact();
+    if let Some(err) = first_error {
+        // Issue #124 fail-loud requirement: a youki iteration error must fail
+        // the workflow, not silently produce a fake youki win.
+        panic!("bench_youki_fork_time: youki iteration failed: {err}");
+    }
+
+    if let Some(summary) = MetricSummary::from_samples(&all_samples) {
+        write_metric_to_artifact("youki", "fork_time", &summary, last_verified);
+    } else {
+        eprintln!("bench_youki_fork_time: no successful samples; artifact not updated");
     }
 }
 
@@ -519,19 +527,14 @@ fn bench_youki_first_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(60));
 
+    let mut all_samples: Vec<Duration> = Vec::new();
     let mut last_verified = false;
-    let mut last_fw_ms: u64 = 0;
-
-    let mut backend_available = true;
+    let mut first_error: Option<String> = None;
 
     group.bench_function("first_write", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for i in 0..iters {
-                if !backend_available {
-                    total += Duration::from_millis(0);
-                    continue;
-                }
                 let bundle_tmp = tempfile::TempDir::new().unwrap();
                 let output_tmp = tempfile::TempDir::new().unwrap();
                 let state_tmp = tempfile::TempDir::new().unwrap();
@@ -548,12 +551,13 @@ fn bench_youki_first_write(c: &mut Criterion) {
                 ) {
                     Ok((elapsed, verified)) => {
                         last_verified = verified;
-                        last_fw_ms = elapsed.as_millis() as u64;
+                        all_samples.push(elapsed);
                         total += elapsed;
                     }
                     Err(e) => {
-                        eprintln!("SKIP bench_youki_first_write: backend error at iter {i}: {e}");
-                        backend_available = false;
+                        first_error
+                            .get_or_insert_with(|| format!("iter {i}: {e}"));
+                        break;
                     }
                 }
             }
@@ -562,8 +566,14 @@ fn bench_youki_first_write(c: &mut Criterion) {
     });
     group.finish();
 
-    if last_fw_ms > 0 {
-        update_artifact_first_write("youki", last_fw_ms, last_verified);
+    if let Some(err) = first_error {
+        panic!("bench_youki_first_write: youki iteration failed: {err}");
+    }
+
+    if let Some(summary) = MetricSummary::from_samples(&all_samples) {
+        write_metric_to_artifact("youki", "first_write", &summary, last_verified);
+    } else {
+        eprintln!("bench_youki_first_write: no successful samples; artifact not updated");
     }
 }
 
