@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       youki:
-        description: "Include YoukiBackend benchmarks (requires youki in PATH — skips gracefully if absent)"
+        description: "Include YoukiBackend benchmarks (libcontainer compiled in — no youki binary needed)"
         required: false
         default: false
         type: boolean
