@@ -35,7 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y crun busybox-static
+          sudo apt-get install -y crun busybox-static libseccomp-dev
 
       - name: Set up minimal rootfs
         run: |
@@ -69,27 +69,33 @@ jobs:
       - name: Build benchmark binaries
         run: |
           cargo build --benches
-          ${{ inputs.youki }} && cargo build --benches --features youki || true
+          if [ "${{ inputs.youki }}" = "true" ]; then
+            cargo build --benches --features youki
+          fi
 
       # crun needs CAP_SYS_ADMIN for pid/mount namespace creation.
       # Use the full cargo path: sudo does not inherit the rustup shim PATH.
       - name: Run microbenchmarks — CrunBackend
         run: |
+          set -o pipefail
           sudo "$(which cargo)" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
 
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         run: |
+          set -o pipefail
           sudo "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
 
       # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
       - name: Run E2E benchmarks — CrunBackend
         run: |
+          set -o pipefail
           cargo bench --bench e2e_runtime 2>&1 | tee e2e-crun.txt
 
       - name: Run E2E benchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         run: |
+          set -o pipefail
           cargo bench --bench e2e_runtime --features youki 2>&1 | tee e2e-youki.txt
 
       - name: Upload Criterion HTML report
