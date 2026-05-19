@@ -21,6 +21,11 @@ name = "container_runtime"
 harness = false
 
 [[bench]]
+name = "fork_latency"
+harness = false
+
+# e2e_runtime is replaced by fork_latency (issue #121); file is a tombstone.
+[[bench]]
 name = "e2e_runtime"
 harness = false
 

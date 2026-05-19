@@ -1,7 +1,8 @@
 # On-demand Criterion benchmark workflow for the ContainerRuntime backends.
 #
-# Runs cargo bench for both the microbenchmark suite (per-op create/start/delete
-# latency) and the E2E suite (N=8 parallel containers, 64 MiB IO workload).
+# Runs cargo bench for:
+#   - container_runtime: per-op create/start/delete microbenchmarks
+#   - fork_latency: real container lifecycle latency (fork_time + first_write)
 #
 # Prerequisites installed at runtime:
 #   - crun (apt: crun)
@@ -93,17 +94,23 @@ jobs:
           sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
             "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
 
-      # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
-      - name: Run E2E benchmarks — CrunBackend
+      # fork_latency bench measures real container lifecycle — needs CAP_SYS_ADMIN.
+      - name: Run fork_latency benchmarks — CrunBackend
         run: |
           set -o pipefail
-          cargo bench --bench e2e_runtime 2>&1 | tee e2e-crun.txt
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench fork_latency 2>&1 | tee fork-latency-crun.txt
 
-      - name: Run E2E benchmarks — YoukiBackend
+      - name: Run fork_latency benchmarks — YoukiBackend
         if: ${{ inputs.youki }}
+        timeout-minutes: 15
+        # YoukiBackend runs real OCI namespace operations via libcontainer;
+        # allow failure so the rest of the workflow still completes if this hangs.
+        continue-on-error: true
         run: |
           set -o pipefail
-          cargo bench --bench e2e_runtime --features youki 2>&1 | tee e2e-youki.txt
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            "$(which cargo)" bench --bench fork_latency --features youki 2>&1 | tee fork-latency-youki.txt
 
       - name: Upload Criterion HTML report
         if: always()
@@ -137,15 +144,15 @@ jobs:
               echo '```'
             fi
 
-            echo "## E2E benchmarks"
+            echo "## Fork latency benchmarks (crun)"
             echo '```'
-            cat e2e-crun.txt 2>/dev/null || echo "(skipped)"
+            cat fork-latency-crun.txt 2>/dev/null || echo "(skipped)"
             echo '```'
 
             if [ "${{ inputs.youki }}" = "true" ]; then
-              echo "## E2E benchmarks (youki)"
+              echo "## Fork latency benchmarks (youki)"
               echo '```'
-              cat e2e-youki.txt 2>/dev/null || echo "(skipped)"
+              cat fork-latency-youki.txt 2>/dev/null || echo "(skipped)"
               echo '```'
             fi
 
