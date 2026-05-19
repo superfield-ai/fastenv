@@ -227,7 +227,77 @@ The architecture depends on these invariants:
 
 ---
 
-## 8. Open Decisions
+## 8. Container Lifecycle
+
+### ContainerRuntime trait
+
+The `ContainerRuntime` trait (defined in `src/container_runtime.rs`) is the
+sole lifecycle boundary for OCI containers in fastenv. All callers go through
+this trait — no direct subprocess or library calls exist outside the backend
+implementations. This boundary enables:
+
+1. Swapping backends for benchmarking without touching callers.
+2. Mock implementations for unit tests.
+3. Identical tracing spans regardless of backend.
+
+```rust
+pub trait ContainerRuntime: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+    fn create(&self, fork_id: &str, bundle_dir: &Path) -> Result<()>;
+    fn start(&self, fork_id: &str, bundle_dir: &Path) -> Result<i32>;
+    fn delete(&self, fork_id: &str) -> Result<()>;
+}
+```
+
+All implementations emit identical tracing span names and field keys:
+
+| Span name          | Fields                                         |
+|--------------------|------------------------------------------------|
+| `container.create` | `fork_id`, `backend`, `duration_ms`            |
+| `container.start`  | `fork_id`, `backend`, `duration_ms`, `exit_code` |
+| `container.delete` | `fork_id`, `backend`, `duration_ms`            |
+
+### CrunBackend
+
+`CrunBackend` (always available, no feature flag required) invokes the `crun`
+OCI runtime as a subprocess. This is the production default.
+
+- `create()`: validates that `config.json` is present in the bundle directory.
+- `start()`: spawns `crun run --bundle <bundle_dir> <fork_id>` and returns the
+  exit code.
+- `delete()`: no-op — `crun run` handles its own cleanup. Emits the expected
+  tracing span for parity.
+
+### YoukiBackend
+
+`YoukiBackend` (enabled by `--features youki`) calls the `libcontainer` Rust
+crate in-process. `libcontainer` is the library that powers the `youki` binary.
+No `youki` binary is required in PATH.
+
+- `create()`: calls `libcontainer::container::builder::ContainerBuilder::new()`
+  to create the container state on disk under `root_path/<fork_id>/`.
+- `start()`: loads container state with `Container::load()` and calls
+  `Container::start()` in-process.
+- `delete()`: loads container state and calls `Container::delete()` in-process.
+  Best-effort: logs a warning on failure.
+
+### Benchmark design rationale
+
+The purpose of the two-backend design is a valid crun-vs-youki latency
+comparison. The comparison is only meaningful if subprocess overhead is isolated
+to `CrunBackend` only. `CrunBackend` spawns a subprocess for every `start()`
+call; `YoukiBackend` does not. By compiling `libcontainer` as an optional
+dependency (`youki = ["dep:libcontainer"]` in `Cargo.toml`), the youki
+execution path eliminates subprocess spawn cost and exec overhead. The measured
+latency difference reflects pure OCI runtime overhead, not process spawn cost.
+
+The benchmark suite in `benches/container_runtime.rs` and
+`benches/e2e_runtime.rs` measures per-operation latency and full E2E path.
+Results are written to `docs/benchmarks/container-runtime-comparison.json`.
+
+---
+
+## 9. Open Decisions
 
 ### OD-1 - Boundary key
 

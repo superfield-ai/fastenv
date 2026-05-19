@@ -27,11 +27,14 @@ harness = false
 [features]
 # Enable the experimental youki library backend for ContainerRuntime.
 # Activates YoukiBackend in src/container_runtime.rs and benchmark comparisons.
+# Uses libcontainer (the Rust library crate powering the youki binary) in-process.
+# No youki binary is required in PATH.
 # Usage: cargo build --features youki
 #        cargo bench --features youki
-youki = []
+youki = ["dep:libcontainer"]
 
 [dependencies]
+libcontainer = { version = "0.6", optional = true }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
