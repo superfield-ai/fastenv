@@ -72,17 +72,15 @@ jobs:
           ${{ inputs.youki }} && cargo build --benches --features youki || true
 
       # crun needs CAP_SYS_ADMIN for pid/mount namespace creation.
-      # The CARGO_HOME/PATH pass-through ensures sudo uses the rustup toolchain.
+      # Use the full cargo path: sudo does not inherit the rustup shim PATH.
       - name: Run microbenchmarks — CrunBackend
         run: |
-          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
-            cargo bench --bench container_runtime 2>&1 | tee microbench-crun.txt
+          sudo "$(which cargo)" bench --bench container_runtime 2>&1 | tee microbench-crun.txt
 
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
         run: |
-          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME \
-            cargo bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
+          sudo "$(which cargo)" bench --bench container_runtime --features youki 2>&1 | tee microbench-youki.txt
 
       # E2E bench only does IO on the host (no real OCI containers) — no sudo needed.
       - name: Run E2E benchmarks — CrunBackend
