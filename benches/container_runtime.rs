@@ -14,9 +14,10 @@
 //
 // NOTE: These benchmarks invoke real OCI runtime binaries and require:
 //   - crun installed at /usr/bin/crun (for CrunBackend)
-//   - youki installed in PATH (for YoukiBackend, --features youki only)
-//   - CAP_SYS_ADMIN (for namespace operations)
+//   - CAP_SYS_ADMIN (for namespace operations) — for YoukiBackend (libcontainer)
 //   - A minimal rootfs at /tmp/fastenv-bench-rootfs
+//
+// YoukiBackend uses libcontainer in-process — no youki binary in PATH needed.
 //
 // On CI or dev hosts without the above, the benchmarks skip gracefully.
 
@@ -147,16 +148,8 @@ fn bench_youki_create(c: &mut Criterion) {
     if !prerequisites_available() {
         eprintln!(
             "SKIP bench_youki_create: prerequisites not met \
-             (need youki in PATH and /tmp/fastenv-bench-rootfs)"
+             (need CAP_SYS_ADMIN and /tmp/fastenv-bench-rootfs; no youki binary required)"
         );
-        return;
-    }
-    if std::process::Command::new("youki")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP bench_youki_create: youki binary not found in PATH");
         return;
     }
 
@@ -167,8 +160,9 @@ fn bench_youki_create(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("create", "youki"), |b| {
         b.iter(|| {
             let tmp = tempfile::TempDir::new().unwrap();
+            let state_tmp = tempfile::TempDir::new().unwrap();
             write_bench_config(tmp.path(), &rootfs);
-            let backend = YoukiBackend;
+            let backend = YoukiBackend::new(state_tmp.path());
             backend.create("bench-fork", tmp.path()).unwrap();
         });
     });
@@ -182,16 +176,8 @@ fn bench_youki_start(c: &mut Criterion) {
     if !prerequisites_available() {
         eprintln!(
             "SKIP bench_youki_start: prerequisites not met \
-             (need youki in PATH and /tmp/fastenv-bench-rootfs)"
+             (need CAP_SYS_ADMIN and /tmp/fastenv-bench-rootfs; no youki binary required)"
         );
-        return;
-    }
-    if std::process::Command::new("youki")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP bench_youki_start: youki binary not found in PATH");
         return;
     }
 
@@ -203,9 +189,10 @@ fn bench_youki_start(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("start", "youki"), |b| {
         b.iter(|| {
             let tmp = tempfile::TempDir::new().unwrap();
+            let state_tmp = tempfile::TempDir::new().unwrap();
             write_bench_config(tmp.path(), &rootfs);
             let fork_id = format!("bench-youki-{}", std::process::id());
-            let backend = YoukiBackend;
+            let backend = YoukiBackend::new(state_tmp.path());
             backend.create(&fork_id, tmp.path()).unwrap();
             let _exit_code = backend.start(&fork_id, tmp.path()).unwrap();
             backend.delete(&fork_id).unwrap();
@@ -221,21 +208,12 @@ fn bench_youki_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("youki/delete");
     group.measurement_time(Duration::from_secs(5));
 
-    // YoukiBackend delete calls `youki delete` — measure when youki is available.
-    if std::process::Command::new("youki")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("SKIP bench_youki_delete: youki binary not found in PATH");
-        group.finish();
-        return;
-    }
-
+    // YoukiBackend delete uses libcontainer in-process — no youki binary needed.
+    // Deleting a non-existent container is best-effort and does not return an error.
     group.bench_function(BenchmarkId::new("delete", "youki"), |b| {
         b.iter(|| {
-            // delete of a non-existent container is a best-effort warn — not an error.
-            let backend = YoukiBackend;
+            let state_tmp = tempfile::TempDir::new().unwrap();
+            let backend = YoukiBackend::new(state_tmp.path());
             let _ = backend.delete("bench-fork-nonexistent");
         });
     });

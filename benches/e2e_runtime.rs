@@ -23,7 +23,7 @@
 //   - /dev/kvm accessible
 //   - A project VM image (kernel + rootfs) at /tmp/fastenv-bench-vm/
 //   - crun installed at /usr/bin/crun
-//   - youki in PATH (--features youki only)
+//   - CAP_SYS_ADMIN (for YoukiBackend via libcontainer; no youki binary needed)
 //
 // The benchmark skips gracefully when prerequisites are not met and writes
 // a stub JSON artifact so the CI artifact path is always present.
