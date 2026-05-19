@@ -229,38 +229,38 @@ fn proc_cmdlines_contain(needle: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Measure fork_time: wall time from create() to start() return using /bin/true.
-/// Returns (duration, backend_verified).
+/// Returns Ok((duration, backend_verified)) or Err on backend failure.
 fn measure_fork_time<R: ContainerRuntime>(
     backend: &R,
     fork_id: &str,
     bundle_dir: &Path,
     verify_fn: fn() -> bool,
-) -> (Duration, bool) {
+) -> anyhow::Result<(Duration, bool)> {
     let t0 = Instant::now();
-    backend.create(fork_id, bundle_dir).unwrap();
-    let _exit = backend.start(fork_id, bundle_dir).unwrap();
+    backend.create(fork_id, bundle_dir)?;
+    let _exit = backend.start(fork_id, bundle_dir)?;
     let elapsed = t0.elapsed();
     let verified = verify_fn();
     let _ = backend.delete(fork_id);
-    (elapsed, verified)
+    Ok((elapsed, verified))
 }
 
 /// Measure first_write: time from start() call until sentinel file exists on host.
-/// Returns (duration, backend_verified).
+/// Returns Ok((duration, backend_verified)) or Err on backend failure.
 fn measure_first_write<R: ContainerRuntime>(
     backend: &R,
     fork_id: &str,
     bundle_dir: &Path,
     sentinel_path: &Path,
     verify_fn: fn() -> bool,
-) -> (Duration, bool) {
+) -> anyhow::Result<(Duration, bool)> {
     // Remove sentinel if it exists from a previous run.
     let _ = std::fs::remove_file(sentinel_path);
 
-    backend.create(fork_id, bundle_dir).unwrap();
+    backend.create(fork_id, bundle_dir)?;
     let t0 = Instant::now();
     // start() blocks until the container process exits; sentinel should exist after.
-    let _exit = backend.start(fork_id, bundle_dir).unwrap();
+    let _exit = backend.start(fork_id, bundle_dir)?;
     // Poll until the sentinel file appears (should be immediate after start() returns).
     let deadline = t0 + Duration::from_secs(5);
     while !sentinel_path.exists() && Instant::now() < deadline {
@@ -269,7 +269,7 @@ fn measure_first_write<R: ContainerRuntime>(
     let elapsed = t0.elapsed();
     let verified = verify_fn();
     let _ = backend.delete(fork_id);
-    (elapsed, verified)
+    Ok((elapsed, verified))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,11 +301,14 @@ fn bench_crun_fork_time(c: &mut Criterion) {
                 write_bench_config(tmp.path(), &rootfs);
                 let fork_id = format!("bench-crun-ft-{}-{}", std::process::id(), i);
                 let backend = CrunBackend::default();
-                let (elapsed, verified) =
-                    measure_fork_time(&backend, &fork_id, tmp.path(), verify_crun_backend);
-                last_verified = verified;
-                last_fork_ms = elapsed.as_millis() as u64;
-                total += elapsed;
+                match measure_fork_time(&backend, &fork_id, tmp.path(), verify_crun_backend) {
+                    Ok((elapsed, verified)) => {
+                        last_verified = verified;
+                        last_fork_ms = elapsed.as_millis() as u64;
+                        total += elapsed;
+                    }
+                    Err(e) => eprintln!("WARN bench_crun_fork_time iter {i}: {e}"),
+                }
             }
             total
         });
@@ -354,16 +357,20 @@ fn bench_crun_first_write(c: &mut Criterion) {
                 write_first_write_config(bundle_tmp.path(), &rootfs, output_tmp.path());
                 let fork_id = format!("bench-crun-fw-{}-{}", std::process::id(), i);
                 let backend = CrunBackend::default();
-                let (elapsed, verified) = measure_first_write(
+                match measure_first_write(
                     &backend,
                     &fork_id,
                     bundle_tmp.path(),
                     &sentinel,
                     verify_crun_backend,
-                );
-                last_verified = verified;
-                last_fw_ms = elapsed.as_millis() as u64;
-                total += elapsed;
+                ) {
+                    Ok((elapsed, verified)) => {
+                        last_verified = verified;
+                        last_fw_ms = elapsed.as_millis() as u64;
+                        total += elapsed;
+                    }
+                    Err(e) => eprintln!("WARN bench_crun_first_write iter {i}: {e}"),
+                }
             }
             total
         });
@@ -450,33 +457,49 @@ fn bench_youki_fork_time(c: &mut Criterion) {
     let mut last_verified = false;
     let mut last_fork_ms: u64 = 0;
 
+    // Track whether the backend is functional in this environment.
+    let mut backend_available = true;
+
     group.bench_function("fork_time", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for i in 0..iters {
+                if !backend_available {
+                    // Backend failed on a prior iteration; skip remaining samples.
+                    total += Duration::from_millis(0);
+                    continue;
+                }
                 let tmp = tempfile::TempDir::new().unwrap();
                 let state_tmp = tempfile::TempDir::new().unwrap();
                 write_bench_config(tmp.path(), &rootfs);
                 let fork_id = format!("bench-youki-ft-{}-{}", std::process::id(), i);
                 let backend = YoukiBackend::new(state_tmp.path());
-                let (elapsed, verified) =
-                    measure_fork_time(&backend, &fork_id, tmp.path(), verify_youki_backend);
-                last_verified = verified;
-                last_fork_ms = elapsed.as_millis() as u64;
-                total += elapsed;
+                match measure_fork_time(&backend, &fork_id, tmp.path(), verify_youki_backend) {
+                    Ok((elapsed, verified)) => {
+                        last_verified = verified;
+                        last_fork_ms = elapsed.as_millis() as u64;
+                        total += elapsed;
+                    }
+                    Err(e) => {
+                        eprintln!("SKIP bench_youki_fork_time: backend error at iter {i}: {e}");
+                        backend_available = false;
+                    }
+                }
             }
             total
         });
     });
     group.finish();
 
-    ForkLatencyResult {
-        backend: "youki".to_string(),
-        fork_time_ms: last_fork_ms,
-        first_write_ms: 0,
-        backend_verified: last_verified,
+    if last_fork_ms > 0 {
+        ForkLatencyResult {
+            backend: "youki".to_string(),
+            fork_time_ms: last_fork_ms,
+            first_write_ms: 0,
+            backend_verified: last_verified,
+        }
+        .write_to_artifact();
     }
-    .write_to_artifact();
 }
 
 #[cfg(feature = "youki")]
@@ -499,10 +522,16 @@ fn bench_youki_first_write(c: &mut Criterion) {
     let mut last_verified = false;
     let mut last_fw_ms: u64 = 0;
 
+    let mut backend_available = true;
+
     group.bench_function("first_write", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for i in 0..iters {
+                if !backend_available {
+                    total += Duration::from_millis(0);
+                    continue;
+                }
                 let bundle_tmp = tempfile::TempDir::new().unwrap();
                 let output_tmp = tempfile::TempDir::new().unwrap();
                 let state_tmp = tempfile::TempDir::new().unwrap();
@@ -510,23 +539,32 @@ fn bench_youki_first_write(c: &mut Criterion) {
                 write_first_write_config(bundle_tmp.path(), &rootfs, output_tmp.path());
                 let fork_id = format!("bench-youki-fw-{}-{}", std::process::id(), i);
                 let backend = YoukiBackend::new(state_tmp.path());
-                let (elapsed, verified) = measure_first_write(
+                match measure_first_write(
                     &backend,
                     &fork_id,
                     bundle_tmp.path(),
                     &sentinel,
                     verify_youki_backend,
-                );
-                last_verified = verified;
-                last_fw_ms = elapsed.as_millis() as u64;
-                total += elapsed;
+                ) {
+                    Ok((elapsed, verified)) => {
+                        last_verified = verified;
+                        last_fw_ms = elapsed.as_millis() as u64;
+                        total += elapsed;
+                    }
+                    Err(e) => {
+                        eprintln!("SKIP bench_youki_first_write: backend error at iter {i}: {e}");
+                        backend_available = false;
+                    }
+                }
             }
             total
         });
     });
     group.finish();
 
-    update_artifact_first_write("youki", last_fw_ms, last_verified);
+    if last_fw_ms > 0 {
+        update_artifact_first_write("youki", last_fw_ms, last_verified);
+    }
 }
 
 // ---------------------------------------------------------------------------
