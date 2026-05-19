@@ -84,6 +84,10 @@ jobs:
 
       - name: Run microbenchmarks — YoukiBackend
         if: ${{ inputs.youki }}
+        timeout-minutes: 15
+        # YoukiBackend microbench runs real OCI namespace operations via libcontainer;
+        # allow failure so the E2E benches still run even if this step hangs or errors.
+        continue-on-error: true
         run: |
           set -o pipefail
           sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
