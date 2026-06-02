@@ -456,6 +456,123 @@ single mechanism cannot do:
 
 ---
 
+## Object-capability policy — the authority axis containment leaves open
+
+Everything above argues one axis: **containment** — *can a compromised unit
+reach beyond its box?* The microkernel section (§H) quietly introduced a second,
+orthogonal one, because capability security is not a containment model at all —
+it is an **authority** model: *given everything a unit legitimately holds inside
+its box, how much can it actually do, and how much of that can it hand to what it
+spawns?* These two axes are independent and multiplicative, and fastenv's
+workload makes the second one matter more than it does almost anywhere else. It
+is worth pulling out, because the object-capability (ocap) *discipline* transfers
+to commodity Linux without changing the kernel, while the kernel-native form
+(§H) does not.
+
+### What ocap actually asks for
+
+An object-capability system has no *ambient authority*. Authority does not flow
+from who you are (a UID, a role, an ACL the kernel checks on your behalf); it
+flows only from what you *hold*. A capability is an unforgeable reference that
+**fuses designation and authority** — naming the resource and being permitted to
+use it are the same act — so a subject can only ever act on the specific objects
+it was explicitly handed. Authority is **delegated, attenuated, and revoked**,
+never assumed. The design target is the **principle of least authority (POLA)**:
+each unit runs with the minimum set of capabilities its current task needs, and
+each thing it spawns gets a *narrowed* subset, never a copy of the parent's full
+reach.
+
+This is the structural opposite of Linux's defaults, which designs A–G all
+inherit: a process opens files *by path* against an ambient filesystem, reaches
+the network through whatever routes exist, and reads secrets from an environment
+it was simply *given*. Authority is ambient and coarse; the boundary is the only
+thing standing between the unit and everything its identity can touch.
+
+### Why agents need the authority axis, not just the boundary
+
+Two properties of the agent workload make ambient authority dangerous in a way
+containment cannot fix:
+
+1. **Prompt injection is a confused-deputy attack, and it happens entirely
+   *inside* the box.** A confused deputy is a program tricked into wielding its
+   legitimate authority on an attacker's behalf. An AI agent is a confused deputy
+   waiting to happen: any content it ingests — a README, a web page, a
+   dependency's post-install script, another tool's output — can steer it to
+   exercise authority it holds for some unrelated purpose. Containment does
+   *nothing* here, because the agent never escapes; it acts within its box, using
+   authority it genuinely has, against a target the attacker chose. Ocap is the
+   one structural answer: if the agent only holds capabilities scoped to the
+   current task, a hijacked agent can only reach what those capabilities name.
+   POLA turns "the model got talked into it" from a breach into a no-op, because
+   the authority to be hijacked was never present. This is the single strongest
+   reason ocap belongs in this document — it closes a gap the entire containment
+   thesis is blind to.
+
+2. **Agents fan out into things that inherit authority by default.** An agent
+   spawns subprocesses, MCP servers, downloaded toolchains, and generated
+   scripts. On ambient-authority Linux each child inherits the parent's full
+   reach — its file access, its sockets, its environment secrets. Ocap reframes
+   every spawn as a **delegation**: the child receives only an attenuated handle,
+   and *can only* sub-delegate, never widen. That is exactly Genode's recursive
+   delegation (§H) and the hierarchical-policy requirement (PRD §4.6) —
+   host → project → agent → tool as a chain where each link hands down strictly
+   less than it holds.
+
+### Doing ocap on commodity Linux
+
+Linux is ambient-authority at the core, so ocap here is a **discipline enforced
+by brokers plus the filtering layers**, not a kernel-native primitive. The
+pieces already exist:
+
+- **File descriptors are Linux's one true capability** — unforgeable, and
+  transferable between processes over Unix sockets (`SCM_RIGHTS`). The canonical
+  move is to hand a unit an *fd* to the exact file/dir/socket it may use, never a
+  *path* into an ambient namespace.
+- **The filtering layers stop being mere defense-in-depth and start *enabling*
+  ocap.** Landlock and seccomp that strip open-by-path and the exotic syscall
+  tail remove the ambient back-channels that would otherwise let a unit route
+  around its capabilities — leaving brokered fds/handles as the *only* way to
+  reach a resource. This is the deeper role of the §F/seccomp mechanisms: not
+  just narrowing a surface, but making capabilities load-bearing.
+- **A host/project broker holds the real authority and vends scoped, revocable
+  proxies.** The host already owns secrets, network egress, and artifact writes
+  (PRD §4.4, §4.6); ocap says the agent never holds the *real* secret or a
+  wide-open socket — it holds a narrow, revocable handle, or a bearer-capability
+  token (macaroon-style: independently attenuable, delegatable, caveat-scoped)
+  for control-plane operations. Containment guarantees the agent cannot bypass
+  the broker to touch the real resource directly; ocap guarantees that even
+  exercising everything it legitimately holds, the authority is minimal and
+  time-boxed.
+
+### How the two axes compose
+
+Containment and ocap answer different questions and neither substitutes for the
+other:
+
+| | Ambient authority inside | Least authority (ocap) inside |
+|---|---|---|
+| **Weak boundary** | Worst case — escapable *and* maximal blast radius | Contained damage, but escapable |
+| **Strong boundary** | Today's default container: hard to escape, but a subverted or injected agent wields broad FS / egress / secrets inside | **The target** — hard to escape *and* a hijacked unit can reach only what it was handed |
+
+fastenv's main thesis (hardware wall at the project, namespace wall at the
+agent) buys the bottom row. Ocap policy is what moves it from the bottom-left
+cell — a strong box around a broadly-authorized interior — to the bottom-right.
+The boundary makes the broker unbypassable; the capability discipline makes what
+the agent holds *worth little to steal*. They multiply.
+
+> **Current state.** fastenv today sits in the bottom-left cell: strong
+> containment around an interior that is still largely ambient-authority — the
+> agent container has broad filesystem and network reach, the agent-layer seccomp
+> profile is not yet wired (see the Seccomp section), and secret/handle brokering
+> is a stated host responsibility (PRD §4.4, §4.6) rather than a built-out
+> capability model. An ocap interior — fd/handle vending, scoped revocable
+> control-plane tokens, attenuated delegation to spawned tools — is a direction
+> the existing requirements point at, not a shipped capability. It is the
+> highest-leverage place to harden the *inside* of the boundary fastenv already
+> provides.
+
+---
+
 ## Seccomp at both layers — defense-in-depth, not the boundary
 
 The same belt-and-suspenders logic that makes Landlock a *rail and not a wall*
