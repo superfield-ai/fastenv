@@ -238,6 +238,151 @@ Outsource isolation to a third-party code-execution API.
   plane the PRD requires and the local-loop latency the success criteria
   demand.
 
+### H. Capability-based microkernel OS (Fuchsia / Zircon)
+
+A different kernel entirely. **Fuchsia** is Google's non-Linux OS; its
+microkernel, **Zircon**, keeps almost nothing in kernel space — scheduling,
+memory, and IPC only — and pushes drivers, filesystems, and network stacks out
+into user-space processes. Isolation is not bolted on with namespaces and
+filters; it is the kernel's native model. Every kernel resource is an *object*
+reached only through an explicit, unforgeable **handle**, and a process can act
+only on the handles it has been granted (object-capability security). There is
+no ambient authority and no global namespace to escape into — the structural
+opposite of the Unix "a process can touch anything its UID permits" model that
+designs A–G all inherit.
+
+- **Boundary strength:** strong *by construction* on a different dimension than
+  the others. Where designs A/F narrow a huge ambient-authority surface with
+  allowlists, and C/D wrap a hardware wall around a Linux guest, Zircon starts
+  from zero authority and adds capabilities explicitly. The kernel attack
+  surface is small (a microkernel exposes a few dozen syscalls, not Linux's
+  ~400), and a compromised driver or network stack is "just" a user process
+  holding a bounded set of handles, not kernel-resident code. This is the
+  cleanest *design* answer to the exact thing the Landlock deep dive flags as
+  Linux's structural ceiling: a sprawling, fail-open kernel surface that an
+  agent running compilers, JITs, and downloaded binaries is unusually good at
+  fishing for bugs in.
+- **Fan-out cost:** in principle excellent — capability handoff and process
+  spawn are cheap primitives, with no VM boot and no per-syscall emulation tax.
+  In practice unknown for this workload: there is no mature container/overlayfs
+  fan-out ecosystem, no `crun`/Firecracker-equivalent fleet tooling, and no
+  warm project-cache story comparable to what the PRD assumes.
+- **Verdict:** **aspirational and orthogonal, not deployable as fastenv's
+  substrate today.** The disqualifier is not the security model — that model is
+  arguably *better* than anything in A–G — it is the workload. Agents run Linux
+  toolchains: `apt`/`pip`/`cargo`, prebuilt `x86_64` ELF binaries, `io_uring`,
+  CUDA, the whole Linux userland. Fuchsia runs Linux binaries only through
+  **Starnix**, a Linux-syscall compatibility layer that is young, partial, and
+  itself re-imports a large Linux-shaped surface — so you would be betting the
+  isolation story on an emulation layer (gVisor's structural weakness, design B)
+  on top of an OS with a fraction of Linux's hardware, toolchain, and operational
+  support. fastenv's bet is on **boundary placement on commodity Linux + KVM**
+  (a hardware wall at the project, a cheap namespace wall at the agent), not on
+  switching the kernel underneath the entire fleet. Zircon is the useful
+  *north-star*: it shows what "isolation as the kernel's native model" looks
+  like, and it validates fastenv's instinct that the shared Linux kernel — not
+  the choice of container vs. VM — is the real ceiling. But adopting it would
+  mean giving up the Linux toolchain compatibility the workload is defined by,
+  which is a non-starter, not a tuning decision.
+
+#### Deep dive: the wider microkernel field
+
+Zircon is not the only kernel that treats isolation as a first-class primitive.
+Each of the projects below is disqualified as fastenv's *substrate* by the same
+two facts that sink Fuchsia — no native Linux toolchain, no proven high-fan-out
+fleet ecosystem — so this is not a shortlist of replacements. It is a list of
+*ideas*, each of which isolates one thing fastenv's Linux-based design either
+borrows already or could borrow later. They are grouped by what they contribute.
+
+**Formal verification of the boundary — seL4.** The high-assurance member of the
+L4 family: a capability-based microkernel (~10k LOC) with machine-checked proofs
+that the implementation matches its spec *and* that the spec enforces integrity
+and confidentiality. No Linux mechanism — namespaces, seccomp, Landlock, KVM —
+has anything close to a proof of its isolation. seL4 also runs as a **hypervisor**
+(via a VMM component / the seL4 Microkit), so the realistic way to run Linux
+agents on it is *as a guest VM on a verified hypervisor* — which lands you back
+at a VM boundary, just with a far smaller, proven TCB underneath it instead of
+KVM+QEMU. That is the single most interesting long-horizon idea here: it attacks
+the exact gap the Landlock dive names (an unprovable, sprawling kernel surface)
+not by shrinking Linux but by shrinking and *proving* the thing that contains it.
+
+**Hierarchical capability delegation — Genode.** Not one kernel but an OS
+framework that runs atop a choice of kernels (seL4, NOVA, Fiasco.OC, or even
+Linux as a base platform). Its defining abstraction is a **recursive system
+structure**: every component is a child sandbox created by a parent that
+explicitly hands down a bounded budget of capabilities and resources (RAM,
+caps, CPU), and a child can only ever sub-delegate, never widen, what it was
+given. That is, almost line for line, fastenv's host→project→agent policy
+hierarchy (PRD §4.6) and Landlock's monotonic-tightening property generalized to
+the whole OS. Genode is the strongest *conceptual* match in this document for
+fastenv's "different boundaries at different layers, each narrowing the last"
+thesis — it is what that thesis looks like when the kernel, not a stack of Linux
+mechanisms, enforces it.
+
+**Shrinking the VMM/hypervisor TCB — NOVA (and Hedron/Bedrock).** A
+*microhypervisor*: microkernel minimality applied to virtualization, so the
+trusted code that stands between guests is a few thousand lines rather than a
+general-purpose kernel plus QEMU. This is the same instinct as fastenv's
+"wrap the VMM itself in seccomp" posture (see the seccomp section), taken to its
+logical end — make the enforcer small enough to audit (or, with seL4, prove)
+rather than merely confining a large one after the fact. The most plausible
+future where a microkernel touches fastenv is here: a verified/minimal
+microhypervisor replacing KVM+Firecracker under the *project* boundary, with the
+agent-container layer unchanged on top.
+
+**Memory-safe kernels — Redox OS.** A Unix-like microkernel written in Rust,
+with a scheme/URL-based resource model that is capability-flavored. Its
+relevance is narrow but pointed: a memory-safe kernel structurally removes a
+large share of the kernel-LPE bug class that the Landlock dive treats as Linux's
+unavoidable ceiling. It is hobbyist-scale today, with only partial Linux
+compatibility (relibc), so it is an existence proof of the idea, not a platform —
+but "the kernel itself can't be memory-corrupted" is exactly the property a
+shared-kernel agent layer most wishes it had.
+
+**Mature, shipping microkernels — QNX and HarmonyOS/HongMeng.** Proof that
+capability/message-passing microkernels ship at industrial scale: **QNX** is a
+POSIX-compliant commercial RTOS in cars, medical, and industrial control;
+Huawei's **HongMeng** microkernel (HarmonyOS NEXT) is a capability-based kernel
+with formally verified components shipping on consumer devices. Both rebut "micro­
+kernels are only research toys." Neither fits us: QNX is tuned for real-time
+embedded determinism and is closed/commercially licensed, not multi-tenant
+server fan-out; HongMeng is a closed, vertically integrated ecosystem. They
+inform the *feasibility* argument, not the substrate choice.
+
+**Reliability-oriented microkernels — MINIX 3 (and the Mach/Hurd lineage).**
+MINIX 3 isolates drivers in user space behind a *reincarnation server* that
+restarts crashed components — a fault-isolation story, closer to "a buggy
+component can't take down the system" than to "adversarial code can't escape."
+Useful framing for the *incompetent-agent* half of the threat model (containment
+of accidents, not just attacks), but the project is largely dormant. The
+historical **Mach** microkernel (and GNU Hurd) is the ancestor of much of this
+lineage and survives in hybrid form inside XNU/macOS — a reminder that "micro­
+kernel ideas in a shipping OS" usually arrive as a *hybrid*, not a purist
+rewrite, which is effectively the pragmatic position fastenv takes on Linux.
+
+**Synthesis — what actually transfers.** Three ideas from this field are worth
+keeping in view, in rough order of how reachable they are for fastenv:
+
+1. **Capability delegation matching the trust hierarchy (Genode).** fastenv
+   already approximates this with host→project→agent policy layering; the
+   microkernel world just shows the cleaner, kernel-enforced form of the same
+   shape. This is a *design influence we can apply now*, not a migration.
+2. **A minimal/verified microhypervisor under the project boundary (NOVA,
+   seL4-as-hypervisor).** The one place a microkernel could realistically slot
+   into fastenv without giving up Linux: swap the *enforcer* of the project VM
+   boundary for a smaller, auditable one, while Linux guests and the `crun`
+   agent layer stay exactly as they are. A long-horizon option, not a near-term
+   plan.
+3. **Memory-safe and/or proven kernel code (Redox, seL4).** The asymptotic
+   answer to the shared-kernel ceiling — but only available by changing the
+   kernel, which the workload forbids today.
+
+The through-line is the same as §H's: every one of these has a *better-than-Linux
+isolation model and a worse-than-Linux ability to run the agent workload*. They
+are north-stars and component-level ideas, not substrates. fastenv's commitment
+remains boundary *placement* on commodity Linux + KVM; the microkernel field
+mainly tells us which direction to evolve the enforcers, not to replace the OS.
+
 ---
 
 ## Side-by-side
@@ -251,6 +396,7 @@ Outsource isolation to a third-party code-execution API.
 | E. One giant VM | Weak | Excellent | Shared kernel | No — PRD non-goal |
 | F. Process sandboxes | Weak/fragile | Excellent | Syscall filter | No — PRD non-goal |
 | G. Remote service | Strong (theirs) | Good (network) | Hardware/VM | No — forfeits host plane |
+| H. Fuchsia / Zircon | Strong (capability) | Unproven | Microkernel/capability | No — not a Linux substrate |
 | **fastenv (VM/project + container/agent)** | **Strong** | **Excellent** | **Hardware + namespace** | **Yes** |
 
 ---
