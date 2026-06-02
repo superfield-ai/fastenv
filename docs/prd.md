@@ -86,6 +86,21 @@ Network policy must be hierarchical:
 Secrets must be injected only when needed, must expire, and must not be baked
 into base images or mounted from host home directories.
 
+### 4.7 Syscall Surface Policy
+
+The operator must be able to define a baseline syscall-surface policy that
+applies to every guest VM and every agent container, as a hardening layer that
+narrows what semi-untrusted code can ask of the kernel. This policy must be
+configurable at three levels, and each level may only further restrict the level
+above it, never relax it:
+
+- a host baseline applied to every guest VM and agent container
+- a project-level policy that may tighten the baseline for one project
+- a per-agent policy that may tighten it further for a single run
+
+This surface-narrowing layer is defense-in-depth around the VM and container
+boundaries; it is not itself the isolation boundary (see Non-Goals).
+
 ## 5. Performance Expectations
 
 - Agent sandbox creation inside a live project VM should remain fast enough
