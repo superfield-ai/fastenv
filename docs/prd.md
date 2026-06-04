@@ -26,6 +26,13 @@ plain container boundary is not strong enough when the goal is to protect the
 host and neighboring projects from compromise. A VM boundary is stronger, but
 VMs alone are too expensive for per-agent fan-out. fastenv combines both.
 
+A second threat is orthogonal to boundary strength: an agent steered by
+hostile content it ingests — a dependency's install script, a fetched web
+page, a poisoned file in the repository — can wield its legitimate authority
+against unintended targets without ever escaping its sandbox. Containment does
+not address this; only limiting the authority an agent holds in the first place
+does.
+
 ## 3. Product Principles
 
 - The project boundary is the VM boundary.
@@ -36,6 +43,9 @@ VMs alone are too expensive for per-agent fan-out. fastenv combines both.
 - The host control plane never executes project code directly.
 - Secrets must be short-lived, scoped, and brokered.
 - Writable sharing across tenants is prohibited.
+- Agents hold only the authority their task requires; the host is the sole
+  source of that authority, and agents may narrow but never widen what they
+  were granted.
 
 ## 4. Functional Requirements
 
@@ -83,8 +93,34 @@ Network policy must be hierarchical:
 - project VM decides project-level access policy
 - agent container may further restrict access for a particular run
 
-Secrets must be injected only when needed, must expire, and must not be baked
-into base images or mounted from host home directories.
+Secrets must not be ambient — they must not be baked into base images, mounted
+from host directories, or delivered as environment variables readable by the
+agent process. They must be brokered: scoped to the requesting agent, redeemed
+at point of use, and expired after use.
+
+### 4.7 Syscall Surface Policy
+
+The operator must be able to define a baseline syscall-surface policy that
+applies to every guest VM and every agent container, as a hardening layer that
+narrows what semi-untrusted code can ask of the kernel. This policy must be
+configurable at three levels, and each level may only further restrict the level
+above it, never relax it:
+
+- a host baseline applied to every guest VM and agent container
+- a project-level policy that may tighten the baseline for one project
+- a per-agent policy that may tighten it further for a single run
+
+This surface-narrowing layer is defense-in-depth around the VM and container
+boundaries; it is not itself the isolation boundary (see Non-Goals).
+
+### 4.8 Authority Model
+
+Agent containers must start with zero ambient authority: no ambient filesystem
+reach beyond their assigned workspace, and no ability to open network
+connections directly. All access to resources outside the workspace must be
+granted explicitly by the host, scoped to the current task, and expressible as
+a minimal set of permissions the agent may further narrow but never widen when
+delegating to tools or subprocesses it spawns.
 
 ## 5. Performance Expectations
 
@@ -117,3 +153,7 @@ into base images or mounted from host home directories.
   boundary.
 - Host and guest eBPF policy remain separate and kernel-local to their
   respective layers.
+- An agent steered by hostile content to act against the host's interests can
+  only affect resources it was explicitly granted for its task; ambient
+  filesystem reach, direct network access, and secrets are not available for
+  it to abuse.

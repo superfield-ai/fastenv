@@ -197,6 +197,38 @@ The two layers are intentionally separate:
 - host eBPF is loaded by the host kernel and only sees host-side state
 - guest eBPF is loaded by the guest kernel and only sees guest-side state
 
+### Seccomp
+
+Seccomp is a syscall-surface filter applied at **both** boundary layers as
+defense-in-depth. It narrows the reachable kernel surface; it does not replace
+the boundary it wraps (see §7).
+
+- **VMM layer (host side).** Firecracker installs a built-in seccomp-bpf
+  allowlist on the VMM process so that a guest-to-VMM escape (a device-emulation
+  or vmexit bug) is contained before it reaches the host. This wraps the
+  *hardware* boundary, not the guest.
+- **Agent layer (guest side).** Each `crun` container should carry a seccomp
+  profile in its OCI `config.json` (`linux.seccomp`) to drop the exotic-syscall
+  tail (`ptrace`, `bpf`, `keyctl`, `io_uring` setup, raw/packet sockets, etc.)
+  that namespaces alone leave reachable inside the guest kernel.
+
+Seccomp policy is hierarchical, mirroring the network model — each layer may
+only **tighten** the layer above it, never loosen it:
+
+- host baseline: a default profile applied to every guest VM and every agent
+  container
+- project VM: a project-level profile that may narrow the host baseline
+- agent container: a per-run profile that may narrow further
+
+**Current state.** The VMM-layer filter is live — Firecracker is spawned without
+`--no-seccomp`, so its default VMM allowlist applies whenever a real VM boots
+(`src/host_control_plane.rs`). The **agent-layer profile is not yet wired**:
+`build_oci_config` in `src/exec.rs` emits `linux.{namespaces, resources}` only,
+with no `linux.seccomp` field, and raw `crun` applies no default profile when
+the field is absent — so agent containers currently run with their syscalls
+**unconfined** by seccomp. Closing this is the target; the hierarchical resolver
+above describes the intended end state, not the present one.
+
 ---
 
 ## 6. Cache Strategy
@@ -220,6 +252,9 @@ The architecture depends on these invariants:
 - `crun` is the agent boundary.
 - eBPF observes and constrains, but does not replace the VM boundary.
 - host and guest eBPF remain distinct kernel-local policy planes.
+- seccomp narrows the syscall surface at both the VMM and agent layers, but
+  wraps each boundary as defense-in-depth — it never replaces it. Per-layer
+  seccomp policy may only tighten, never loosen, the layer above.
 - The host never mounts a writable project workspace directly for untrusted
   code.
 - Outputs leave the VM only through controlled export paths.
