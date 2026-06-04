@@ -1026,11 +1026,7 @@ const PERF_MMAP_OVERHEAD_PAGES: usize = 1;
 /// - `cpu`: CPU index to attach the perf event to (typically 0).
 /// - `stop_rx`: receiving half of an `mpsc` channel; any send or drop
 ///   unblocks the loop.
-pub fn poll_perf_ring_buffer(
-    map_fd: c_int,
-    cpu: u32,
-    stop_rx: mpsc::Receiver<()>,
-) -> Result<()> {
+pub fn poll_perf_ring_buffer(map_fd: c_int, cpu: u32, stop_rx: mpsc::Receiver<()>) -> Result<()> {
     // Attempt to open a perf event FD for BPF output on the given CPU.
     // On failure (EPERM, ENOSYS, etc.) we fall back to a no-op drain that
     // simply waits for the stop signal — this keeps the function safe in
@@ -1127,10 +1123,10 @@ fn open_bpf_output_perf_event(cpu: u32) -> Result<c_int> {
         libc::syscall(
             SYS_PERF_EVENT_OPEN,
             &attr as *const PerfEventAttr as *const libc::c_void,
-            -1i32,          // pid: any process
-            cpu as i32,     // cpu
-            -1i32,          // group_fd
-            0i64,           // flags: PERF_FLAG_FD_CLOEXEC not needed here
+            -1i32,      // pid: any process
+            cpu as i32, // cpu
+            -1i32,      // group_fd
+            0i64,       // flags: PERF_FLAG_FD_CLOEXEC not needed here
         )
     };
 
@@ -1504,7 +1500,11 @@ mod tests {
         // map_fd = -1 is a sentinel for "no real BPF map"; cpu = 0.
         // The function is expected to return Ok(()) promptly.
         let result = poll_perf_ring_buffer(-1, 0, stop_rx);
-        assert!(result.is_ok(), "poll_perf_ring_buffer should return Ok: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "poll_perf_ring_buffer should return Ok: {:?}",
+            result
+        );
     }
 
     /// Verify that `poll_perf_ring_buffer` exits cleanly when the stop sender
@@ -1517,6 +1517,10 @@ mod tests {
         drop(stop_tx);
 
         let result = poll_perf_ring_buffer(-1, 0, stop_rx);
-        assert!(result.is_ok(), "poll_perf_ring_buffer should return Ok on channel close: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "poll_perf_ring_buffer should return Ok on channel close: {:?}",
+            result
+        );
     }
 }

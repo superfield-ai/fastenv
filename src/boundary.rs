@@ -165,8 +165,7 @@ mod tests {
 
     use crate::exec::GuestNetworkMode;
     use crate::host_control_plane::{
-        ArtifactRecord, NetworkPolicy, ProjectVmSpec, SecretLease, VmBootError,
-        VmState,
+        ArtifactRecord, NetworkPolicy, ProjectVmSpec, SecretLease, VmBootError, VmState,
     };
     use crate::registry::{ForkEntry, QuotaMode, Registry};
 
