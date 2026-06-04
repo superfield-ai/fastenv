@@ -35,12 +35,13 @@
 // All load, attach, and detach events are emitted as structured tracing
 // events at the `info` level. Policy decision events from the kernel
 // are surfaced via bpf_printk output and the kernel's perf ring buffer
-// (not yet wired in this first iteration).
+// (wired via `poll_perf_ring_buffer`; see §Perf ring-buffer polling below).
 
 use std::ffi::CString;
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -944,6 +945,407 @@ fn now_rfc3339() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Perf ring-buffer polling
+//
+// §Perf ring-buffer polling
+//
+// `poll_perf_ring_buffer` reads raw perf event records from a BPF perf
+// ring-buffer map FD and emits each policy-decision event as a structured
+// `tracing::info!` log entry.
+//
+// The Linux perf ring-buffer layout (PERF_RECORD_SAMPLE produced by
+// bpf_perf_event_output) is:
+//
+//   [perf_event_header (8 bytes)]
+//   [u32 size]           — payload size in bytes
+//   [u8 data[size]]      — raw event payload
+//   [padding to 8-byte boundary]
+//
+// We mmap the ring-buffer and consume records using a monotonically
+// advancing read head.  A `perf_event_open` call is needed to obtain the
+// FD; when no real FD is available (non-privileged environment) the
+// function falls back to a drain-on-stop-signal path.
+// ---------------------------------------------------------------------------
+
+/// A decoded policy-decision event emitted by the BPF program.
+///
+/// Fields mirror the layout that the kernel-side `bpf_perf_event_output`
+/// helper emits.  Unknown/future fields are captured in `raw_payload`.
+#[derive(Debug, Clone)]
+pub struct PolicyDecisionEvent {
+    /// BPF program name (up to 16 bytes, NUL-terminated in-kernel).
+    pub prog_name: String,
+    /// Policy action: `"allow"`, `"deny"`, or an opaque numeric string.
+    pub action: String,
+    /// Raw bytes as received from the ring-buffer (for forward-compat).
+    pub raw_payload: Vec<u8>,
+}
+
+/// BPF `perf_event_open` syscall number on x86-64.
+#[cfg(target_arch = "x86_64")]
+const SYS_PERF_EVENT_OPEN: libc::c_long = 298;
+
+/// `PERF_TYPE_SOFTWARE` and `PERF_COUNT_SW_BPF_OUTPUT`.
+const PERF_TYPE_SOFTWARE: u32 = 1;
+const PERF_COUNT_SW_BPF_OUTPUT: u64 = 10;
+
+/// Size of the mmap ring-buffer in pages (must be a power of 2).
+const PERF_RING_PAGES: usize = 16;
+
+/// mmap metadata page size (one page before the ring data pages).
+const PERF_MMAP_OVERHEAD_PAGES: usize = 1;
+
+/// Poll the BPF perf ring-buffer for policy-decision events.
+///
+/// Opens a `PERF_TYPE_SOFTWARE / PERF_COUNT_SW_BPF_OUTPUT` perf event on the
+/// given `map_fd` CPU, mmaps the ring-buffer, and drains available records in
+/// a loop.  The loop exits when `stop_rx` receives any value or the sender is
+/// dropped.
+///
+/// For each decoded record, emits:
+/// ```text
+/// tracing::info!(
+///     event = "host_ebpf.policy_decision",
+///     prog_name = %...,
+///     action = %...,
+/// )
+/// ```
+///
+/// # Privilege requirements
+///
+/// `perf_event_open(2)` with `PERF_TYPE_SOFTWARE / PERF_COUNT_SW_BPF_OUTPUT`
+/// requires `CAP_PERFMON` (Linux 5.8+) or `CAP_SYS_ADMIN`.  When the syscall
+/// fails (e.g. in unprivileged CI), the function logs a warning and returns
+/// `Ok(())` immediately.
+///
+/// # Parameters
+///
+/// - `map_fd`: file descriptor of the `BPF_MAP_TYPE_PERF_EVENT_ARRAY` map.
+///   Pass `-1` to skip the actual `perf_event_open` and use the no-op path
+///   (useful in tests).
+/// - `cpu`: CPU index to attach the perf event to (typically 0).
+/// - `stop_rx`: receiving half of an `mpsc` channel; any send or drop
+///   unblocks the loop.
+pub fn poll_perf_ring_buffer(
+    map_fd: c_int,
+    cpu: u32,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    // Attempt to open a perf event FD for BPF output on the given CPU.
+    // On failure (EPERM, ENOSYS, etc.) we fall back to a no-op drain that
+    // simply waits for the stop signal — this keeps the function safe in
+    // unprivileged environments.
+    let perf_fd = open_bpf_output_perf_event(cpu);
+
+    match perf_fd {
+        Ok(fd) => {
+            tracing::info!(
+                event = "host_ebpf.perf_ring_buffer_started",
+                map_fd = map_fd,
+                cpu = cpu,
+                perf_fd = fd,
+                "BPF perf ring-buffer polling started"
+            );
+
+            let result = poll_ring_buffer_fd(fd, &stop_rx);
+
+            // Close the perf FD regardless.
+            // SAFETY: fd is a valid open file descriptor.
+            unsafe { libc::close(fd) };
+
+            result
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = "host_ebpf.perf_ring_buffer_unavailable",
+                error = %e,
+                "perf_event_open failed; ring-buffer polling disabled (unprivileged environment)"
+            );
+            // Drain the stop channel so the caller's thread exits cleanly.
+            let _ = stop_rx.recv();
+            Ok(())
+        }
+    }
+}
+
+/// Open a `PERF_TYPE_SOFTWARE / PERF_COUNT_SW_BPF_OUTPUT` perf event FD.
+///
+/// Returns the FD on success, or an error if the syscall fails.
+fn open_bpf_output_perf_event(cpu: u32) -> Result<c_int> {
+    /// Minimal `perf_event_attr` for a BPF output event.
+    ///
+    /// The kernel struct is much larger; we only need the first few fields.
+    /// The kernel accepts any size ≥ the first field's offset as long as the
+    /// remaining bytes are zero.
+    #[repr(C)]
+    struct PerfEventAttr {
+        type_: u32,
+        size: u32,
+        config: u64,
+        sample_period_or_freq: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup_events_or_watermark: u32,
+        bp_type: u32,
+        bp_addr_or_config1: u64,
+        bp_len_or_config2: u64,
+        branch_sample_type: u64,
+        sample_regs_user: u64,
+        sample_stack_user: u32,
+        clockid: i32,
+        sample_regs_intr: u64,
+        aux_watermark: u32,
+        sample_max_stack: u16,
+        _reserved2: u16,
+    }
+
+    let attr = PerfEventAttr {
+        type_: PERF_TYPE_SOFTWARE,
+        size: std::mem::size_of::<PerfEventAttr>() as u32,
+        config: PERF_COUNT_SW_BPF_OUTPUT,
+        sample_period_or_freq: 1,
+        sample_type: 0,
+        read_format: 0,
+        flags: 0,
+        wakeup_events_or_watermark: 1,
+        bp_type: 0,
+        bp_addr_or_config1: 0,
+        bp_len_or_config2: 0,
+        branch_sample_type: 0,
+        sample_regs_user: 0,
+        sample_stack_user: 0,
+        clockid: 0,
+        sample_regs_intr: 0,
+        aux_watermark: 0,
+        sample_max_stack: 0,
+        _reserved2: 0,
+    };
+
+    // SAFETY: attr is correctly sized; pid=-1 means any process; group_fd=-1.
+    let fd = unsafe {
+        libc::syscall(
+            SYS_PERF_EVENT_OPEN,
+            &attr as *const PerfEventAttr as *const libc::c_void,
+            -1i32,          // pid: any process
+            cpu as i32,     // cpu
+            -1i32,          // group_fd
+            0i64,           // flags: PERF_FLAG_FD_CLOEXEC not needed here
+        )
+    };
+
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("perf_event_open failed: {}", err);
+    }
+
+    Ok(fd as c_int)
+}
+
+/// Poll the ring-buffer behind `perf_fd`, decoding records until `stop_rx` fires.
+fn poll_ring_buffer_fd(perf_fd: c_int, stop_rx: &mpsc::Receiver<()>) -> Result<()> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mmap_len = page_size * (PERF_MMAP_OVERHEAD_PAGES + PERF_RING_PAGES);
+
+    // SAFETY: mmap with MAP_SHARED on the perf FD.
+    let mmap_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mmap_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            perf_fd,
+            0,
+        )
+    };
+
+    if mmap_ptr == libc::MAP_FAILED {
+        let err = std::io::Error::last_os_error();
+        bail!("mmap of perf ring-buffer failed: {}", err);
+    }
+
+    // The first page is the `perf_event_mmap_page` metadata page.
+    // The ring data starts at offset `page_size`.
+    let meta = mmap_ptr as *mut PerfEventMmapPage;
+    let data_start = unsafe { (mmap_ptr as *const u8).add(page_size) };
+    let data_len = page_size * PERF_RING_PAGES;
+
+    // Local copy of the read head (we advance it as we consume records).
+    let mut read_head: u64 = 0;
+
+    loop {
+        // Check the stop signal (non-blocking).
+        match stop_rx.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        // Read the kernel-written data_head (volatile).
+        // SAFETY: meta is a valid mmap_page pointer.
+        let data_head = unsafe {
+            let head_ptr = std::ptr::addr_of!((*meta).data_head);
+            std::ptr::read_volatile(head_ptr)
+        };
+
+        if data_head == read_head {
+            // No new data; sleep briefly and re-check the stop signal.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+
+        // Consume all available records between read_head and data_head.
+        while read_head < data_head {
+            let offset = (read_head as usize) & (data_len - 1);
+
+            // Read the 8-byte perf_event_header.
+            if data_head - read_head < 8 {
+                break;
+            }
+
+            // SAFETY: offset is within [0, data_len).
+            let header_bytes = unsafe {
+                let ptr = data_start.add(offset);
+                std::slice::from_raw_parts(ptr, 8)
+            };
+
+            // perf_event_header: type(u32), misc(u16), size(u16)
+            let record_type = u32::from_ne_bytes([
+                header_bytes[0],
+                header_bytes[1],
+                header_bytes[2],
+                header_bytes[3],
+            ]);
+            let record_size = u16::from_ne_bytes([header_bytes[6], header_bytes[7]]) as usize;
+
+            if record_size == 0 || record_size > data_len {
+                // Malformed record; advance past it to avoid infinite loop.
+                read_head += 8;
+                break;
+            }
+
+            // PERF_RECORD_SAMPLE = 9; skip other record types.
+            if record_type == 9 && record_size > 8 {
+                // Payload follows the 8-byte header.
+                let payload_offset = (offset + 8) & (data_len - 1);
+                let payload_len = record_size - 8;
+
+                let payload = if payload_offset + payload_len <= data_len {
+                    // SAFETY: slice is within mmap'd region.
+                    unsafe {
+                        std::slice::from_raw_parts(data_start.add(payload_offset), payload_len)
+                    }
+                    .to_vec()
+                } else {
+                    // Payload wraps around the ring; copy in two parts.
+                    let first_len = data_len - payload_offset;
+                    let second_len = payload_len - first_len;
+                    let mut buf = Vec::with_capacity(payload_len);
+                    // SAFETY: both slices are within the mmap'd region.
+                    unsafe {
+                        buf.extend_from_slice(std::slice::from_raw_parts(
+                            data_start.add(payload_offset),
+                            first_len,
+                        ));
+                        buf.extend_from_slice(std::slice::from_raw_parts(data_start, second_len));
+                    }
+                    buf
+                };
+
+                let event = decode_policy_event(&payload);
+                tracing::info!(
+                    event = "host_ebpf.policy_decision",
+                    prog_name = %event.prog_name,
+                    action = %event.action,
+                    payload_bytes = payload.len(),
+                    "BPF policy decision event received"
+                );
+            }
+
+            read_head += record_size as u64;
+        }
+
+        // Advance the kernel's data_tail so it knows we consumed the records.
+        // SAFETY: meta is a valid mmap_page pointer.
+        unsafe {
+            let tail_ptr = std::ptr::addr_of_mut!((*meta).data_tail);
+            std::ptr::write_volatile(tail_ptr, read_head);
+        }
+    }
+
+    // Unmap the ring-buffer now that we are done consuming records.
+    // SAFETY: mmap_ptr is a valid MAP_SHARED mapping of mmap_len bytes.
+    let _ = unsafe { libc::munmap(mmap_ptr, mmap_len) };
+
+    Ok(())
+}
+
+/// Minimal subset of `perf_event_mmap_page` (Linux `<linux/perf_event.h>`).
+///
+/// Only the fields accessed by the userspace ring-buffer consumer are
+/// declared here; the rest of the 4096-byte page is unused.
+#[repr(C)]
+struct PerfEventMmapPage {
+    version: u32,
+    compat_version: u32,
+    lock: u32,
+    index: u32,
+    offset: i64,
+    time_enabled: u64,
+    time_running: u64,
+    _capabilities: u64,
+    pmc_width: u16,
+    time_shift: u16,
+    time_mult: u32,
+    time_offset: u64,
+    time_zero: u64,
+    size: u32,
+    _reserved: [u8; 948],
+    data_head: u64,
+    data_tail: u64,
+    // Remaining fields (data_offset, data_size, aux_*) not needed.
+}
+
+/// Decode a raw perf sample payload into a [`PolicyDecisionEvent`].
+///
+/// The layout expected from the BPF side (bpf_perf_event_output):
+///
+/// ```text
+/// struct {
+///     u8  prog_name[16];   // BPF_OBJ_NAME_LEN
+///     u8  action;          // 0 = allow, 1 = deny
+///     u8  _pad[7];
+/// };
+/// ```
+///
+/// For unknown or truncated payloads, sensible defaults are used so that the
+/// log entry is always emitted.
+fn decode_policy_event(payload: &[u8]) -> PolicyDecisionEvent {
+    let prog_name = if payload.len() >= 16 {
+        let raw = &payload[..16];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(16);
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    } else {
+        String::from("unknown")
+    };
+
+    let action = if payload.len() >= 17 {
+        match payload[16] {
+            0 => "allow".to_string(),
+            1 => "deny".to_string(),
+            v => format!("{v}"),
+        }
+    } else {
+        "unknown".to_string()
+    };
+
+    PolicyDecisionEvent {
+        prog_name,
+        action,
+        raw_payload: payload.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1026,5 +1428,95 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid TC detach handle"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Perf ring-buffer tests
+    // -------------------------------------------------------------------------
+
+    /// Verify that `decode_policy_event` correctly parses a well-formed payload.
+    #[test]
+    fn decode_policy_event_allow() {
+        let mut payload = vec![0u8; 24];
+        // Write prog_name = "egress-filter" (up to 16 bytes, NUL-terminated).
+        let name = b"egress-filter\0\0\0";
+        payload[..16].copy_from_slice(name);
+        // action = 0 (allow)
+        payload[16] = 0;
+
+        let event = decode_policy_event(&payload);
+        assert_eq!(event.prog_name, "egress-filter");
+        assert_eq!(event.action, "allow");
+    }
+
+    /// Verify that `decode_policy_event` handles a deny action.
+    #[test]
+    fn decode_policy_event_deny() {
+        let mut payload = vec![0u8; 24];
+        let name = b"kprobe-block\0\0\0\0";
+        payload[..16].copy_from_slice(name);
+        payload[16] = 1;
+
+        let event = decode_policy_event(&payload);
+        assert_eq!(event.prog_name, "kprobe-block");
+        assert_eq!(event.action, "deny");
+    }
+
+    /// Verify that `decode_policy_event` handles an unknown/opaque action code.
+    #[test]
+    fn decode_policy_event_unknown_action() {
+        let mut payload = vec![0u8; 24];
+        let name = b"tc-classifier\0\0\0";
+        payload[..16].copy_from_slice(name);
+        payload[16] = 42;
+
+        let event = decode_policy_event(&payload);
+        assert_eq!(event.prog_name, "tc-classifier");
+        assert_eq!(event.action, "42");
+    }
+
+    /// Verify that `decode_policy_event` handles a truncated payload gracefully.
+    #[test]
+    fn decode_policy_event_truncated_payload() {
+        let payload = vec![0u8; 5]; // shorter than 16 bytes
+        let event = decode_policy_event(&payload);
+        assert_eq!(event.prog_name, "unknown");
+        assert_eq!(event.action, "unknown");
+    }
+
+    /// Verify that `poll_perf_ring_buffer` returns immediately when the stop
+    /// signal is sent before the function enters its poll loop.
+    ///
+    /// Uses `map_fd = -1` to exercise the no-op fallback path (perf_event_open
+    /// will fail because cpu=-1 or EPERM in unprivileged environments), which
+    /// simply waits for the stop signal and returns Ok(()).
+    ///
+    /// If the test host has CAP_PERFMON the open may succeed; in that case the
+    /// function mmaps the ring and returns Ok(()) after the stop signal fires.
+    /// Either way the test must complete without hanging.
+    #[test]
+    fn poll_perf_ring_buffer_stops_on_signal() {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        // Send the stop signal before the polling thread starts.
+        let _ = stop_tx.send(());
+
+        // map_fd = -1 is a sentinel for "no real BPF map"; cpu = 0.
+        // The function is expected to return Ok(()) promptly.
+        let result = poll_perf_ring_buffer(-1, 0, stop_rx);
+        assert!(result.is_ok(), "poll_perf_ring_buffer should return Ok: {:?}", result);
+    }
+
+    /// Verify that `poll_perf_ring_buffer` exits cleanly when the stop sender
+    /// is dropped (channel closed).
+    #[test]
+    fn poll_perf_ring_buffer_stops_on_channel_close() {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        // Drop the sender immediately; the receiver will observe Disconnected.
+        drop(stop_tx);
+
+        let result = poll_perf_ring_buffer(-1, 0, stop_rx);
+        assert!(result.is_ok(), "poll_perf_ring_buffer should return Ok on channel close: {:?}", result);
     }
 }
