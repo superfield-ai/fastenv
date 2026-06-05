@@ -2,4 +2,4 @@
 # Persistent per-workspace target dir.  sccache (rustc-wrapper) and the
 # sccache disk cache are configured globally in ~/.cargo/config.toml and
 # ~/.config/sccache/config.toml respectively.
-target-dir = "${HOME}/.cache/cargo-target/fastenv"
+target-dir = "~/.cache/cargo-target/fastenv"
